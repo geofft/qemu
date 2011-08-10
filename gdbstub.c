@@ -1787,3 +1787,8 @@ int gdbserver_start(const char *device)
     return 0;
 }
 #endif
+
+int gdbserver_running(void)
+{
+    return gdbserver_state != NULL;
+}

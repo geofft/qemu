@@ -262,6 +262,22 @@ STEXI
 Show the active virtual memory mappings.
 ETEXI
 
+#if defined(TARGET_I386)
+    {
+        .name       = "pg",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show the page table",
+        .mhandler.cmd = pg_info,
+    },
+#endif
+
+STEXI
+@item info pg
+@findex pg
+Show the page table.
+ETEXI
+
     {
         .name       = "mtree",
         .args_type  = "",

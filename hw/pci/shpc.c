@@ -7,6 +7,7 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/msi.h"
+#include "qapi/qmp/qerror.h"
 
 /* TODO: model power only and disabled slot states. */
 /* TODO: handle SERR and wakeups */
@@ -158,7 +159,7 @@ static void shpc_interrupt_update(PCIDevice *d)
     for (slot = 0; slot < shpc->nslots; ++slot) {
         uint8_t event = shpc->config[SHPC_SLOT_EVENT_LATCH(slot)];
         uint8_t disable = shpc->config[SHPC_SLOT_EVENT_SERR_INT_DIS(d, slot)];
-        uint32_t mask = 1 << SHPC_IDX_TO_LOGICAL(slot);
+        uint32_t mask = 1U << SHPC_IDX_TO_LOGICAL(slot);
         if (event & ~disable) {
             int_locator |= mask;
         }
@@ -490,65 +491,94 @@ static const MemoryRegionOps shpc_mmio_ops = {
         .max_access_size = 4,
     },
 };
-
-static int shpc_device_hotplug(DeviceState *qdev, PCIDevice *affected_dev,
-                               PCIHotplugState hotplug_state)
+static void shpc_device_hotplug_common(PCIDevice *affected_dev, int *slot,
+                                       SHPCDevice *shpc, Error **errp)
 {
     int pci_slot = PCI_SLOT(affected_dev->devfn);
-    uint8_t state;
-    uint8_t led;
-    PCIDevice *d = DO_UPCAST(PCIDevice, qdev, qdev);
-    SHPCDevice *shpc = d->shpc;
-    int slot = SHPC_PCI_TO_IDX(pci_slot);
-    if (pci_slot < SHPC_IDX_TO_PCI(0) || slot >= shpc->nslots) {
-        error_report("Unsupported PCI slot %d for standard hotplug "
-                     "controller. Valid slots are between %d and %d.",
-                     pci_slot, SHPC_IDX_TO_PCI(0),
-                     SHPC_IDX_TO_PCI(shpc->nslots) - 1);
-        return -1;
+    *slot = SHPC_PCI_TO_IDX(pci_slot);
+
+    if (pci_slot < SHPC_IDX_TO_PCI(0) || *slot >= shpc->nslots) {
+        error_setg(errp, "Unsupported PCI slot %d for standard hotplug "
+                   "controller. Valid slots are between %d and %d.",
+                   pci_slot, SHPC_IDX_TO_PCI(0),
+                   SHPC_IDX_TO_PCI(shpc->nslots) - 1);
+        return;
     }
+}
+
+void shpc_device_hotplug_cb(HotplugHandler *hotplug_dev, DeviceState *dev,
+                            Error **errp)
+{
+    Error *local_err = NULL;
+    PCIDevice *pci_hotplug_dev = PCI_DEVICE(hotplug_dev);
+    SHPCDevice *shpc = pci_hotplug_dev->shpc;
+    int slot;
+
+    shpc_device_hotplug_common(PCI_DEVICE(dev), &slot, shpc, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
     /* Don't send event when device is enabled during qemu machine creation:
      * it is present on boot, no hotplug event is necessary. We do send an
      * event when the device is disabled later. */
-    if (hotplug_state == PCI_COLDPLUG_ENABLED) {
+    if (!dev->hotplugged) {
         shpc_set_status(shpc, slot, 0, SHPC_SLOT_STATUS_MRL_OPEN);
         shpc_set_status(shpc, slot, SHPC_SLOT_STATUS_PRSNT_7_5W,
                         SHPC_SLOT_STATUS_PRSNT_MASK);
-        return 0;
+        return;
     }
-    if (hotplug_state == PCI_HOTPLUG_DISABLED) {
-        shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |= SHPC_SLOT_EVENT_BUTTON;
-        state = shpc_get_status(shpc, slot, SHPC_SLOT_STATE_MASK);
-        led = shpc_get_status(shpc, slot, SHPC_SLOT_PWR_LED_MASK);
-        if (state == SHPC_STATE_DISABLED && led == SHPC_LED_OFF) {
-            shpc_free_devices_in_slot(shpc, slot);
-            shpc_set_status(shpc, slot, 1, SHPC_SLOT_STATUS_MRL_OPEN);
-            shpc_set_status(shpc, slot, SHPC_SLOT_STATUS_PRSNT_EMPTY,
-                            SHPC_SLOT_STATUS_PRSNT_MASK);
-            shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
-                SHPC_SLOT_EVENT_MRL |
-                SHPC_SLOT_EVENT_PRESENCE;
-        }
+
+    /* This could be a cancellation of the previous removal.
+     * We check MRL state to figure out. */
+    if (shpc_get_status(shpc, slot, SHPC_SLOT_STATUS_MRL_OPEN)) {
+        shpc_set_status(shpc, slot, 0, SHPC_SLOT_STATUS_MRL_OPEN);
+        shpc_set_status(shpc, slot, SHPC_SLOT_STATUS_PRSNT_7_5W,
+                        SHPC_SLOT_STATUS_PRSNT_MASK);
+        shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
+            SHPC_SLOT_EVENT_BUTTON |
+            SHPC_SLOT_EVENT_MRL |
+            SHPC_SLOT_EVENT_PRESENCE;
     } else {
-        /* This could be a cancellation of the previous removal.
-         * We check MRL state to figure out. */
-        if (shpc_get_status(shpc, slot, SHPC_SLOT_STATUS_MRL_OPEN)) {
-            shpc_set_status(shpc, slot, 0, SHPC_SLOT_STATUS_MRL_OPEN);
-            shpc_set_status(shpc, slot, SHPC_SLOT_STATUS_PRSNT_7_5W,
-                            SHPC_SLOT_STATUS_PRSNT_MASK);
-            shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
-                SHPC_SLOT_EVENT_BUTTON |
-                SHPC_SLOT_EVENT_MRL |
-                SHPC_SLOT_EVENT_PRESENCE;
-        } else {
-            /* Press attention button to cancel removal */
-            shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
-                SHPC_SLOT_EVENT_BUTTON;
-        }
+        /* Press attention button to cancel removal */
+        shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
+            SHPC_SLOT_EVENT_BUTTON;
     }
     shpc_set_status(shpc, slot, 0, SHPC_SLOT_STATUS_66);
-    shpc_interrupt_update(d);
-    return 0;
+    shpc_interrupt_update(pci_hotplug_dev);
+}
+
+void shpc_device_hot_unplug_request_cb(HotplugHandler *hotplug_dev,
+                                       DeviceState *dev, Error **errp)
+{
+    Error *local_err = NULL;
+    PCIDevice *pci_hotplug_dev = PCI_DEVICE(hotplug_dev);
+    SHPCDevice *shpc = pci_hotplug_dev->shpc;
+    uint8_t state;
+    uint8_t led;
+    int slot;
+
+    shpc_device_hotplug_common(PCI_DEVICE(dev), &slot, shpc, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |= SHPC_SLOT_EVENT_BUTTON;
+    state = shpc_get_status(shpc, slot, SHPC_SLOT_STATE_MASK);
+    led = shpc_get_status(shpc, slot, SHPC_SLOT_PWR_LED_MASK);
+    if (state == SHPC_STATE_DISABLED && led == SHPC_LED_OFF) {
+        shpc_free_devices_in_slot(shpc, slot);
+        shpc_set_status(shpc, slot, 1, SHPC_SLOT_STATUS_MRL_OPEN);
+        shpc_set_status(shpc, slot, SHPC_SLOT_STATUS_PRSNT_EMPTY,
+                        SHPC_SLOT_STATUS_PRSNT_MASK);
+        shpc->config[SHPC_SLOT_EVENT_LATCH(slot)] |=
+            SHPC_SLOT_EVENT_MRL |
+            SHPC_SLOT_EVENT_PRESENCE;
+    }
+    shpc_set_status(shpc, slot, 0, SHPC_SLOT_STATUS_66);
+    shpc_interrupt_update(pci_hotplug_dev);
 }
 
 /* Initialize the SHPC structure in bridge's BAR. */
@@ -616,7 +646,8 @@ int shpc_init(PCIDevice *d, PCIBus *sec_bus, MemoryRegion *bar, unsigned offset)
                           d, "shpc-mmio", SHPC_SIZEOF(d));
     shpc_cap_update_dword(d);
     memory_region_add_subregion(bar, offset, &shpc->mmio);
-    pci_bus_hotplug(sec_bus, shpc_device_hotplug, &d->qdev);
+
+    qbus_set_hotplug_handler(BUS(sec_bus), DEVICE(d), NULL);
 
     d->cap_present |= QEMU_PCI_CAP_SHPC;
     return 0;
@@ -633,12 +664,21 @@ void shpc_cleanup(PCIDevice *d, MemoryRegion *bar)
     d->cap_present &= ~QEMU_PCI_CAP_SHPC;
     memory_region_del_subregion(bar, &shpc->mmio);
     /* TODO: cleanup config space changes? */
+}
+
+void shpc_free(PCIDevice *d)
+{
+    SHPCDevice *shpc = d->shpc;
+    if (!shpc) {
+        return;
+    }
+    object_unparent(OBJECT(&shpc->mmio));
     g_free(shpc->config);
     g_free(shpc->cmask);
     g_free(shpc->wmask);
     g_free(shpc->w1cmask);
-    memory_region_destroy(&shpc->mmio);
     g_free(shpc);
+    d->shpc = NULL;
 }
 
 void shpc_cap_write_config(PCIDevice *d, uint32_t addr, uint32_t val, int l)

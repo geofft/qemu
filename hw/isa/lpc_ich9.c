@@ -7,7 +7,7 @@
  *               VA Linux Systems Japan K.K.
  * Copyright (C) 2012 Jason Baron <jbaron@redhat.com>
  *
- * This is based on piix_pci.c, but heavily modified.
+ * This is based on piix.c, but heavily modified.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -563,12 +563,19 @@ static void ich9_lpc_add_properties(ICH9LPCState *lpc)
     ich9_pm_add_properties(OBJECT(lpc), &lpc->pm, NULL);
 }
 
-static int ich9_lpc_initfn(PCIDevice *d)
+static void ich9_lpc_initfn(Object *obj)
+{
+    ICH9LPCState *lpc = ICH9_LPC_DEVICE(obj);
+
+    ich9_lpc_add_properties(lpc);
+}
+
+static int ich9_lpc_init(PCIDevice *d)
 {
     ICH9LPCState *lpc = ICH9_LPC_DEVICE(d);
     ISABus *isa_bus;
 
-    isa_bus = isa_bus_new(&d->qdev, get_system_io());
+    isa_bus = isa_bus_new(DEVICE(d), get_system_memory(), get_system_io());
 
     pci_set_long(d->wmask + ICH9_LPC_PMBASE,
                  ICH9_LPC_PMBASE_BASE_ADDRESS_MASK);
@@ -589,10 +596,31 @@ static int ich9_lpc_initfn(PCIDevice *d)
     memory_region_add_subregion_overlap(pci_address_space_io(d),
                                         ICH9_RST_CNT_IOPORT, &lpc->rst_cnt_mem,
                                         1);
-
-    ich9_lpc_add_properties(lpc);
-
     return 0;
+}
+
+static void ich9_device_plug_cb(HotplugHandler *hotplug_dev,
+                                DeviceState *dev, Error **errp)
+{
+    ICH9LPCState *lpc = ICH9_LPC_DEVICE(hotplug_dev);
+
+    ich9_pm_device_plug_cb(&lpc->pm, dev, errp);
+}
+
+static void ich9_device_unplug_request_cb(HotplugHandler *hotplug_dev,
+                                          DeviceState *dev, Error **errp)
+{
+    ICH9LPCState *lpc = ICH9_LPC_DEVICE(hotplug_dev);
+
+    ich9_pm_device_unplug_request_cb(&lpc->pm, dev, errp);
+}
+
+static void ich9_device_unplug_cb(HotplugHandler *hotplug_dev,
+                                  DeviceState *dev, Error **errp)
+{
+    ICH9LPCState *lpc = ICH9_LPC_DEVICE(hotplug_dev);
+
+    ich9_pm_device_unplug_cb(&lpc->pm, dev, errp);
 }
 
 static bool ich9_rst_cnt_needed(void *opaque)
@@ -616,7 +644,6 @@ static const VMStateDescription vmstate_ich9_lpc = {
     .name = "ICH9LPC",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = ich9_lpc_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(d, ICH9LPCState),
@@ -639,26 +666,41 @@ static void ich9_lpc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
+    AcpiDeviceIfClass *adevc = ACPI_DEVICE_IF_CLASS(klass);
 
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
     dc->reset = ich9_lpc_reset;
-    k->init = ich9_lpc_initfn;
+    k->init = ich9_lpc_init;
     dc->vmsd = &vmstate_ich9_lpc;
-    dc->no_user = 1;
     k->config_write = ich9_lpc_config_write;
     dc->desc = "ICH9 LPC bridge";
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_ICH9_8;
     k->revision = ICH9_A2_LPC_REVISION;
     k->class_id = PCI_CLASS_BRIDGE_ISA;
-
+    /*
+     * Reason: part of ICH9 southbridge, needs to be wired up by
+     * pc_q35_init()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
+    hc->plug = ich9_device_plug_cb;
+    hc->unplug_request = ich9_device_unplug_request_cb;
+    hc->unplug = ich9_device_unplug_cb;
+    adevc->ospm_status = ich9_pm_ospm_status;
 }
 
 static const TypeInfo ich9_lpc_info = {
     .name       = TYPE_ICH9_LPC_DEVICE,
     .parent     = TYPE_PCI_DEVICE,
     .instance_size = sizeof(struct ICH9LPCState),
+    .instance_init = ich9_lpc_initfn,
     .class_init  = ich9_lpc_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { TYPE_HOTPLUG_HANDLER },
+        { TYPE_ACPI_DEVICE_IF },
+        { }
+    }
 };
 
 static void ich9_lpc_register(void)

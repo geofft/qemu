@@ -31,7 +31,6 @@
 #include "qemu/queue.h"
 #include "qemu/thread.h"
 #include "ui/console.h"
-#include "monitor/monitor.h"
 #include "audio/audio.h"
 #include "qemu/bitmap.h"
 #include <zlib.h>
@@ -40,6 +39,7 @@
 #include "keymaps.h"
 #include "vnc-palette.h"
 #include "vnc-enc-zrle.h"
+#include "qapi-types.h"
 
 // #define _VNC_DEBUG 1
 
@@ -77,12 +77,21 @@ typedef void VncSendHextileTile(VncState *vs,
                                 void *last_fg,
                                 int *has_bg, int *has_fg);
 
-/* VNC_MAX_WIDTH must be a multiple of 16. */
-#define VNC_MAX_WIDTH 2560
+/* VNC_DIRTY_PIXELS_PER_BIT is the number of dirty pixels represented
+ * by one bit in the dirty bitmap, should be a power of 2 */
+#define VNC_DIRTY_PIXELS_PER_BIT 16
+
+/* VNC_MAX_WIDTH must be a multiple of VNC_DIRTY_PIXELS_PER_BIT. */
+
+#define VNC_MAX_WIDTH ROUND_UP(2560, VNC_DIRTY_PIXELS_PER_BIT)
 #define VNC_MAX_HEIGHT 2048
 
 /* VNC_DIRTY_BITS is the number of bits in the dirty bitmap. */
-#define VNC_DIRTY_BITS (VNC_MAX_WIDTH / 16)
+#define VNC_DIRTY_BITS (VNC_MAX_WIDTH / VNC_DIRTY_PIXELS_PER_BIT)
+
+/* VNC_DIRTY_BPL (BPL = bits per line) might be greater than
+ * VNC_DIRTY_BITS due to alignment */
+#define VNC_DIRTY_BPL(x) (sizeof((x)->dirty) / VNC_MAX_HEIGHT * BITS_PER_BYTE)
 
 #define VNC_STAT_RECT  64
 #define VNC_STAT_COLS (VNC_MAX_WIDTH / VNC_STAT_RECT)
@@ -118,7 +127,8 @@ typedef struct VncRectStat VncRectStat;
 struct VncSurface
 {
     struct timeval last_freq_check;
-    DECLARE_BITMAP(dirty[VNC_MAX_HEIGHT], VNC_MAX_WIDTH / 16);
+    DECLARE_BITMAP(dirty[VNC_MAX_HEIGHT],
+                   VNC_MAX_WIDTH / VNC_DIRTY_PIXELS_PER_BIT);
     VncRectStat stats[VNC_STAT_ROWS][VNC_STAT_COLS];
     pixman_image_t *fb;
     pixman_format_code_t format;
@@ -140,13 +150,15 @@ typedef enum VncSharePolicy {
 struct VncDisplay
 {
     QTAILQ_HEAD(, VncState) clients;
+    int num_connecting;
+    int num_shared;
     int num_exclusive;
+    int connections_limit;
     VncSharePolicy share_policy;
     int lsock;
 #ifdef CONFIG_VNC_WS
     int lwebsock;
-    bool websocket;
-    char *ws_display;
+    bool ws_enabled;
 #endif
     DisplaySurface *ds;
     DisplayChangeListener dcl;
@@ -161,14 +173,19 @@ struct VncDisplay
     struct VncSurface guest;   /* guest visible surface (aka ds->surface) */
     pixman_image_t *server;    /* vnc server surface */
 
-    char *display;
+    const char *id;
+    QTAILQ_ENTRY(VncDisplay) next;
+    bool enabled;
+    bool is_unix;
     char *password;
     time_t expires;
     int auth;
+    int subauth; /* Used by VeNCrypt */
+    int ws_auth; /* Used by websockets */
+    bool ws_tls; /* Used by websockets */
     bool lossy;
     bool non_adaptive;
 #ifdef CONFIG_VNC_TLS
-    int subauth; /* Used by VeNCrypt */
     VncDisplayTLS tls;
 #endif
 #ifdef CONFIG_VNC_SASL
@@ -253,10 +270,12 @@ struct VncState
     VncDisplay *vd;
     int need_update;
     int force_update;
+    int has_dirty;
     uint32_t features;
     int absolute;
     int last_x;
     int last_y;
+    uint32_t last_bmask;
     int client_width;
     int client_height;
     VncShareMode share_mode;
@@ -267,29 +286,28 @@ struct VncState
     int minor;
 
     int auth;
+    int subauth; /* Used by VeNCrypt */
     char challenge[VNC_AUTH_CHALLENGE_SIZE];
 #ifdef CONFIG_VNC_TLS
-    int subauth; /* Used by VeNCrypt */
     VncStateTLS tls;
 #endif
 #ifdef CONFIG_VNC_SASL
     VncStateSASL sasl;
 #endif
 #ifdef CONFIG_VNC_WS
-#ifdef CONFIG_VNC_TLS
-    VncStateTLS ws_tls;
-#endif /* CONFIG_VNC_TLS */
     bool encode_ws;
     bool websocket;
 #endif /* CONFIG_VNC_WS */
 
-    QObject *info;
+    VncClientInfo *info;
 
     Buffer output;
     Buffer input;
 #ifdef CONFIG_VNC_WS
     Buffer ws_input;
     Buffer ws_output;
+    size_t ws_payload_remain;
+    WsMask ws_payload_mask;
 #endif
     /* current output mode information */
     VncWritePixels *write_pixels;

@@ -362,7 +362,7 @@ static void pfpu_start(MilkymistPFPUState *s)
             i = 0;
             while (pfpu_decode_insn(s)) {
                 /* decode at most MICROCODE_WORDS instructions */
-                if (i++ >= MICROCODE_WORDS) {
+                if (++i >= MICROCODE_WORDS) {
                     error_report("milkymist_pfpu: too many instructions "
                             "executed in microcode. No VECTOUT?");
                     break;
@@ -513,8 +513,7 @@ static const VMStateDescription vmstate_milkymist_pfpu = {
     .name = "milkymist-pfpu",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, MilkymistPFPUState, R_MAX),
         VMSTATE_UINT32_ARRAY(gp_regs, MilkymistPFPUState, 128),
         VMSTATE_UINT32_ARRAY(microcode, MilkymistPFPUState, MICROCODE_WORDS),

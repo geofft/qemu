@@ -46,6 +46,16 @@ do { printf("APB: " fmt , ## __VA_ARGS__); } while (0)
 #define APB_DPRINTF(fmt, ...)
 #endif
 
+/* debug IOMMU */
+//#define DEBUG_IOMMU
+
+#ifdef DEBUG_IOMMU
+#define IOMMU_DPRINTF(fmt, ...) \
+do { printf("IOMMU: " fmt , ## __VA_ARGS__); } while (0)
+#else
+#define IOMMU_DPRINTF(fmt, ...)
+#endif
+
 /*
  * Chipset docs:
  * PBM: "UltraSPARC IIi User's Manual",
@@ -58,17 +68,63 @@ do { printf("APB: " fmt , ## __VA_ARGS__); } while (0)
 #define PBM_PCI_IMR_MASK    0x7fffffff
 #define PBM_PCI_IMR_ENABLED 0x80000000
 
-#define POR          (1 << 31)
-#define SOFT_POR     (1 << 30)
-#define SOFT_XIR     (1 << 29)
-#define BTN_POR      (1 << 28)
-#define BTN_XIR      (1 << 27)
+#define POR          (1U << 31)
+#define SOFT_POR     (1U << 30)
+#define SOFT_XIR     (1U << 29)
+#define BTN_POR      (1U << 28)
+#define BTN_XIR      (1U << 27)
 #define RESET_MASK   0xf8000000
 #define RESET_WCMASK 0x98000000
 #define RESET_WMASK  0x60000000
 
 #define MAX_IVEC 0x40
 #define NO_IRQ_REQUEST (MAX_IVEC + 1)
+
+#define IOMMU_PAGE_SIZE_8K      (1ULL << 13)
+#define IOMMU_PAGE_MASK_8K      (~(IOMMU_PAGE_SIZE_8K - 1))
+#define IOMMU_PAGE_SIZE_64K     (1ULL << 16)
+#define IOMMU_PAGE_MASK_64K     (~(IOMMU_PAGE_SIZE_64K - 1))
+
+#define IOMMU_NREGS             3
+
+#define IOMMU_CTRL              0x0
+#define IOMMU_CTRL_TBW_SIZE     (1ULL << 2)
+#define IOMMU_CTRL_MMU_EN       (1ULL)
+
+#define IOMMU_CTRL_TSB_SHIFT    16
+
+#define IOMMU_BASE              0x8
+#define IOMMU_FLUSH             0x10
+
+#define IOMMU_TTE_DATA_V        (1ULL << 63)
+#define IOMMU_TTE_DATA_SIZE     (1ULL << 61)
+#define IOMMU_TTE_DATA_W        (1ULL << 1)
+
+#define IOMMU_TTE_PHYS_MASK_8K  0x1ffffffe000ULL
+#define IOMMU_TTE_PHYS_MASK_64K 0x1ffffff8000ULL
+
+#define IOMMU_TSB_8K_OFFSET_MASK_8M    0x00000000007fe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_16M   0x0000000000ffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_32M   0x0000000001ffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_64M   0x0000000003ffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_128M  0x0000000007ffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_256M  0x000000000fffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_512M  0x000000001fffe000ULL
+#define IOMMU_TSB_8K_OFFSET_MASK_1G    0x000000003fffe000ULL
+
+#define IOMMU_TSB_64K_OFFSET_MASK_64M  0x0000000003ff0000ULL
+#define IOMMU_TSB_64K_OFFSET_MASK_128M 0x0000000007ff0000ULL
+#define IOMMU_TSB_64K_OFFSET_MASK_256M 0x000000000fff0000ULL
+#define IOMMU_TSB_64K_OFFSET_MASK_512M 0x000000001fff0000ULL
+#define IOMMU_TSB_64K_OFFSET_MASK_1G   0x000000003fff0000ULL
+#define IOMMU_TSB_64K_OFFSET_MASK_2G   0x000000007fff0000ULL
+
+typedef struct IOMMUState {
+    AddressSpace iommu_as;
+    MemoryRegion iommu;
+
+    uint64_t regs[IOMMU_NREGS];
+} IOMMUState;
 
 #define TYPE_APB "pbm"
 
@@ -83,9 +139,10 @@ typedef struct APBState {
     MemoryRegion pci_mmio;
     MemoryRegion pci_ioport;
     uint64_t pci_irq_in;
-    uint32_t iommu[4];
+    IOMMUState iommu;
     uint32_t pci_control[16];
     uint32_t pci_irq_map[8];
+    uint32_t pci_err_irq_map[4];
     uint32_t obio_irq_map[32];
     qemu_irq *pbm_irqs;
     qemu_irq *ivec_irqs;
@@ -141,10 +198,226 @@ static inline void pbm_clear_request(APBState *s, unsigned int irq_num)
     s->irq_request = NO_IRQ_REQUEST;
 }
 
+static AddressSpace *pbm_pci_dma_iommu(PCIBus *bus, void *opaque, int devfn)
+{
+    IOMMUState *is = opaque;
+
+    return &is->iommu_as;
+}
+
+/* Called from RCU critical section */
+static IOMMUTLBEntry pbm_translate_iommu(MemoryRegion *iommu, hwaddr addr,
+                                         bool is_write)
+{
+    IOMMUState *is = container_of(iommu, IOMMUState, iommu);
+    hwaddr baseaddr, offset;
+    uint64_t tte;
+    uint32_t tsbsize;
+    IOMMUTLBEntry ret = {
+        .target_as = &address_space_memory,
+        .iova = 0,
+        .translated_addr = 0,
+        .addr_mask = ~(hwaddr)0,
+        .perm = IOMMU_NONE,
+    };
+
+    if (!(is->regs[IOMMU_CTRL >> 3] & IOMMU_CTRL_MMU_EN)) {
+        /* IOMMU disabled, passthrough using standard 8K page */
+        ret.iova = addr & IOMMU_PAGE_MASK_8K;
+        ret.translated_addr = addr;
+        ret.addr_mask = IOMMU_PAGE_MASK_8K;
+        ret.perm = IOMMU_RW;
+
+        return ret;
+    }
+
+    baseaddr = is->regs[IOMMU_BASE >> 3];
+    tsbsize = (is->regs[IOMMU_CTRL >> 3] >> IOMMU_CTRL_TSB_SHIFT) & 0x7;
+
+    if (is->regs[IOMMU_CTRL >> 3] & IOMMU_CTRL_TBW_SIZE) {
+        /* 64K */
+        switch (tsbsize) {
+        case 0:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_64M) >> 13;
+            break;
+        case 1:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_128M) >> 13;
+            break;
+        case 2:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_256M) >> 13;
+            break;
+        case 3:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_512M) >> 13;
+            break;
+        case 4:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_1G) >> 13;
+            break;
+        case 5:
+            offset = (addr & IOMMU_TSB_64K_OFFSET_MASK_2G) >> 13;
+            break;
+        default:
+            /* Not implemented, error */
+            return ret;
+        }
+    } else {
+        /* 8K */
+        switch (tsbsize) {
+        case 0:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_8M) >> 10;
+            break;
+        case 1:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_16M) >> 10;
+            break;
+        case 2:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_32M) >> 10;
+            break;
+        case 3:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_64M) >> 10;
+            break;
+        case 4:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_128M) >> 10;
+            break;
+        case 5:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_256M) >> 10;
+            break;
+        case 6:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_512M) >> 10;
+            break;
+        case 7:
+            offset = (addr & IOMMU_TSB_8K_OFFSET_MASK_1G) >> 10;
+            break;
+        }
+    }
+
+    tte = ldq_be_phys(&address_space_memory, baseaddr + offset);
+
+    if (!(tte & IOMMU_TTE_DATA_V)) {
+        /* Invalid mapping */
+        return ret;
+    }
+
+    if (tte & IOMMU_TTE_DATA_W) {
+        /* Writeable */
+        ret.perm = IOMMU_RW;
+    } else {
+        ret.perm = IOMMU_RO;
+    }
+
+    /* Extract phys */
+    if (tte & IOMMU_TTE_DATA_SIZE) {
+        /* 64K */
+        ret.iova = addr & IOMMU_PAGE_MASK_64K;
+        ret.translated_addr = tte & IOMMU_TTE_PHYS_MASK_64K;
+        ret.addr_mask = (IOMMU_PAGE_SIZE_64K - 1);
+    } else {
+        /* 8K */
+        ret.iova = addr & IOMMU_PAGE_MASK_8K;
+        ret.translated_addr = tte & IOMMU_TTE_PHYS_MASK_8K;
+        ret.addr_mask = (IOMMU_PAGE_SIZE_8K - 1);
+    }
+
+    return ret;
+}
+
+static MemoryRegionIOMMUOps pbm_iommu_ops = {
+    .translate = pbm_translate_iommu,
+};
+
+static void iommu_config_write(void *opaque, hwaddr addr,
+                               uint64_t val, unsigned size)
+{
+    IOMMUState *is = opaque;
+
+    IOMMU_DPRINTF("IOMMU config write: 0x%" HWADDR_PRIx " val: %" PRIx64
+                  " size: %d\n", addr, val, size);
+
+    switch (addr) {
+    case IOMMU_CTRL:
+        if (size == 4) {
+            is->regs[IOMMU_CTRL >> 3] &= 0xffffffffULL;
+            is->regs[IOMMU_CTRL >> 3] |= val << 32;
+        } else {
+            is->regs[IOMMU_CTRL >> 3] = val;
+        }
+        break;
+    case IOMMU_CTRL + 0x4:
+        is->regs[IOMMU_CTRL >> 3] &= 0xffffffff00000000ULL;
+        is->regs[IOMMU_CTRL >> 3] |= val & 0xffffffffULL;
+        break;
+    case IOMMU_BASE:
+        if (size == 4) {
+            is->regs[IOMMU_BASE >> 3] &= 0xffffffffULL;
+            is->regs[IOMMU_BASE >> 3] |= val << 32;
+        } else {
+            is->regs[IOMMU_BASE >> 3] = val;
+        }
+        break;
+    case IOMMU_BASE + 0x4:
+        is->regs[IOMMU_BASE >> 3] &= 0xffffffff00000000ULL;
+        is->regs[IOMMU_BASE >> 3] |= val & 0xffffffffULL;
+        break;
+    case IOMMU_FLUSH:
+    case IOMMU_FLUSH + 0x4:
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                  "apb iommu: Unimplemented register write "
+                  "reg 0x%" HWADDR_PRIx " size 0x%x value 0x%" PRIx64 "\n",
+                  addr, size, val);
+        break;
+    }
+}
+
+static uint64_t iommu_config_read(void *opaque, hwaddr addr, unsigned size)
+{
+    IOMMUState *is = opaque;
+    uint64_t val;
+
+    switch (addr) {
+    case IOMMU_CTRL:
+        if (size == 4) {
+            val = is->regs[IOMMU_CTRL >> 3] >> 32;
+        } else {
+            val = is->regs[IOMMU_CTRL >> 3];
+        }
+        break;
+    case IOMMU_CTRL + 0x4:
+        val = is->regs[IOMMU_CTRL >> 3] & 0xffffffffULL;
+        break;
+    case IOMMU_BASE:
+        if (size == 4) {
+            val = is->regs[IOMMU_BASE >> 3] >> 32;
+        } else {
+            val = is->regs[IOMMU_BASE >> 3];
+        }
+        break;
+    case IOMMU_BASE + 0x4:
+        val = is->regs[IOMMU_BASE >> 3] & 0xffffffffULL;
+        break;
+    case IOMMU_FLUSH:
+    case IOMMU_FLUSH + 0x4:
+        val = 0;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "apb iommu: Unimplemented register read "
+                      "reg 0x%" HWADDR_PRIx " size 0x%x\n",
+                      addr, size);
+        val = 0;
+        break;
+    }
+
+    IOMMU_DPRINTF("IOMMU config read: 0x%" HWADDR_PRIx " val: %" PRIx64
+                  " size: %d\n", addr, val, size);
+
+    return val;
+}
+
 static void apb_config_writel (void *opaque, hwaddr addr,
                                uint64_t val, unsigned size)
 {
     APBState *s = opaque;
+    IOMMUState *is = &s->iommu;
 
     APB_DPRINTF("%s: addr " TARGET_FMT_plx " val %" PRIx64 "\n", __func__, addr, val);
 
@@ -152,10 +425,8 @@ static void apb_config_writel (void *opaque, hwaddr addr,
     case 0x30 ... 0x4f: /* DMA error registers */
         /* XXX: not implemented yet */
         break;
-    case 0x200 ... 0x20b: /* IOMMU */
-        s->iommu[(addr & 0xf) >> 2] = val;
-        break;
-    case 0x20c ... 0x3ff: /* IOMMU flush */
+    case 0x200 ... 0x217: /* IOMMU */
+        iommu_config_write(is, (addr & 0x1f), val, size);
         break;
     case 0xc00 ... 0xc3f: /* PCI interrupt control */
         if (addr & 4) {
@@ -168,7 +439,7 @@ static void apb_config_writel (void *opaque, hwaddr addr,
             pbm_check_irqs(s);
         }
         break;
-    case 0x1000 ... 0x1080: /* OBIO interrupt control */
+    case 0x1000 ... 0x107f: /* OBIO interrupt control */
         if (addr & 4) {
             unsigned int ino = ((addr & 0xff) >> 3);
             s->obio_irq_map[ino] &= PBM_PCI_IMR_MASK;
@@ -228,6 +499,7 @@ static uint64_t apb_config_readl (void *opaque,
                                   hwaddr addr, unsigned size)
 {
     APBState *s = opaque;
+    IOMMUState *is = &s->iommu;
     uint32_t val;
 
     switch (addr & 0xffff) {
@@ -235,11 +507,8 @@ static uint64_t apb_config_readl (void *opaque,
         val = 0;
         /* XXX: not implemented yet */
         break;
-    case 0x200 ... 0x20b: /* IOMMU */
-        val = s->iommu[(addr & 0xf) >> 2];
-        break;
-    case 0x20c ... 0x3ff: /* IOMMU flush */
-        val = 0;
+    case 0x200 ... 0x217: /* IOMMU */
+        val = iommu_config_read(is, (addr & 0x1f), size);
         break;
     case 0xc00 ... 0xc3f: /* PCI interrupt control */
         if (addr & 4) {
@@ -248,9 +517,16 @@ static uint64_t apb_config_readl (void *opaque,
             val = 0;
         }
         break;
-    case 0x1000 ... 0x1080: /* OBIO interrupt control */
+    case 0x1000 ... 0x107f: /* OBIO interrupt control */
         if (addr & 4) {
             val = s->obio_irq_map[(addr & 0xff) >> 3];
+        } else {
+            val = 0;
+        }
+        break;
+    case 0x1080 ... 0x108f: /* PCI bus error */
+        if (addr & 4) {
+            val = s->pci_err_irq_map[(addr & 0xf) >> 3];
         } else {
             val = 0;
         }
@@ -390,6 +666,7 @@ PCIBus *pci_apb_init(hwaddr special_base,
     SysBusDevice *s;
     PCIHostState *phb;
     APBState *d;
+    IOMMUState *is;
     PCIDevice *pci_dev;
     PCIBridge *br;
 
@@ -419,6 +696,15 @@ PCIBus *pci_apb_init(hwaddr special_base,
     d->ivec_irqs = ivec_irqs;
 
     pci_create_simple(phb->bus, 0, "pbm-pci");
+
+    /* APB IOMMU */
+    is = &d->iommu;
+    memset(is, 0, sizeof(IOMMUState));
+
+    memory_region_init_iommu(&is->iommu, OBJECT(dev), &pbm_iommu_ops,
+                             "iommu-apb", UINT64_MAX);
+    address_space_init(&is->iommu_as, &is->iommu, "pbm-as");
+    pci_setup_iommu(phb->bus, pbm_pci_dma_iommu, is);
 
     /* APB secondary busses */
     pci_dev = pci_create_multifunction(phb->bus, PCI_DEVFN(1, 0), true,
@@ -476,6 +762,9 @@ static int pci_pbm_init_device(SysBusDevice *dev)
     for (i = 0; i < 8; i++) {
         s->pci_irq_map[i] = (0x1f << 6) | (i << 2);
     }
+    for (i = 0; i < 2; i++) {
+        s->pci_err_irq_map[i] = (0x1f << 6) | 0x30;
+    }
     for (i = 0; i < 32; i++) {
         s->obio_irq_map[i] = ((0x1f << 6) | 0x20) + i;
     }
@@ -503,24 +792,29 @@ static int pci_pbm_init_device(SysBusDevice *dev)
     return 0;
 }
 
-static int pbm_pci_host_init(PCIDevice *d)
+static void pbm_pci_host_realize(PCIDevice *d, Error **errp)
 {
     pci_set_word(d->config + PCI_COMMAND,
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
     pci_set_word(d->config + PCI_STATUS,
                  PCI_STATUS_FAST_BACK | PCI_STATUS_66MHZ |
                  PCI_STATUS_DEVSEL_MEDIUM);
-    return 0;
 }
 
 static void pbm_pci_host_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init = pbm_pci_host_init;
+    k->realize = pbm_pci_host_realize;
     k->vendor_id = PCI_VENDOR_ID_SUN;
     k->device_id = PCI_DEVICE_ID_SUN_SABRE;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo pbm_pci_host_info = {

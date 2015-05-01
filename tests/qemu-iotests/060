@@ -40,7 +40,7 @@ trap "_cleanup; exit \$status" 0 1 2 3 15
 
 # This tests qocw2-specific low-level functionality
 _supported_fmt qcow2
-_supported_proto generic
+_supported_proto file
 _supported_os Linux
 
 rt_offset=65536  # 0x10000 (XXX: just an assumption)
@@ -68,13 +68,16 @@ poke_file "$TEST_IMG" "$l1_offset" "\x80\x00\x00\x00\x00\x03\x00\x00"
 _check_test_img
 
 # The corrupt bit should not be set anyway
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 
 # Try to write something, thereby forcing the corrupt bit to be set
 $QEMU_IO -c "$OPEN_RW" -c "write -P 0x2a 0 512" | _filter_qemu_io
 
 # The corrupt bit must now be set
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+
+# This information should be available through qemu-img info
+_img_info --format-specific
 
 # Try to open the image R/W (which should fail)
 $QEMU_IO -c "$OPEN_RW" -c "read 0 512" 2>&1 | _filter_qemu_io \
@@ -99,19 +102,19 @@ poke_file "$TEST_IMG" "$(($rb_offset+8))" "\x00\x01"
 # Redirect new data cluster onto refcount block
 poke_file "$TEST_IMG" "$l2_offset" "\x80\x00\x00\x00\x00\x02\x00\x00"
 _check_test_img
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 $QEMU_IO -c "$OPEN_RW" -c "write -P 0x2a 0 512" | _filter_qemu_io
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 
 # Try to fix it
 _check_test_img -r all
 
 # The corrupt bit should be cleared
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 
 # Look if it's really really fixed
 $QEMU_IO -c "$OPEN_RW" -c "write -P 0x2a 0 512" | _filter_qemu_io
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 
 echo
 echo "=== Testing cluster data reference into inactive L2 table ==="
@@ -124,19 +127,121 @@ $QEMU_IO -c "$OPEN_RW" -c "write -P 2 0 512" | _filter_qemu_io
 poke_file "$TEST_IMG" "$l2_offset_after_snapshot" \
                       "\x80\x00\x00\x00\x00\x04\x00\x00"
 _check_test_img
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 $QEMU_IO -c "$OPEN_RW" -c "write -P 3 0 512" | _filter_qemu_io
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 _check_test_img -r all
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 $QEMU_IO -c "$OPEN_RW" -c "write -P 4 0 512" | _filter_qemu_io
-./qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
+$PYTHON qcow2.py "$TEST_IMG" dump-header | grep incompatible_features
 
 # Check data
 $QEMU_IO -c "$OPEN_RO" -c "read -P 4 0 512" | _filter_qemu_io
 $QEMU_IMG snapshot -a foo "$TEST_IMG"
 _check_test_img
 $QEMU_IO -c "$OPEN_RO" -c "read -P 1 0 512" | _filter_qemu_io
+
+echo
+echo "=== Testing overlap while COW is in flight ==="
+echo
+# compat=0.10 is required in order to make the following discard actually
+# unallocate the sector rather than make it a zero sector - we want COW, after
+# all.
+IMGOPTS='compat=0.10' _make_test_img 1G
+# Write two clusters, the second one enforces creation of an L2 table after
+# the first data cluster.
+$QEMU_IO -c 'write 0k 64k' -c 'write 512M 64k' "$TEST_IMG" | _filter_qemu_io
+# Discard the first cluster. This cluster will soon enough be reallocated and
+# used for COW.
+$QEMU_IO -c 'discard 0k 64k' "$TEST_IMG" | _filter_qemu_io
+# Now, corrupt the image by marking the second L2 table cluster as free.
+poke_file "$TEST_IMG" '131084' "\x00\x00" # 0x2000c
+# Start a write operation requiring COW on the image stopping it right before
+# doing the read; then, trigger the corruption prevention by writing anything to
+# any unallocated cluster, leading to an attempt to overwrite the second L2
+# table. Finally, resume the COW write and see it fail (but not crash).
+echo "open -o file.driver=blkdebug $TEST_IMG
+break cow_read 0
+aio_write 0k 1k
+wait_break 0
+write 64k 64k
+resume 0" | $QEMU_IO | _filter_qemu_io
+
+echo
+echo "=== Testing unallocated image header ==="
+echo
+_make_test_img 64M
+# Create L1/L2
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$rb_offset" "\x00\x00"
+$QEMU_IO -c "write 64k 64k" "$TEST_IMG" | _filter_qemu_io
+
+echo
+echo "=== Testing unaligned L1 entry ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+# This will be masked with ~(512 - 1) = ~0x1ff, so whether the lower 9 bits are
+# aligned or not does not matter
+poke_file "$TEST_IMG" "$l1_offset" "\x80\x00\x00\x00\x00\x04\x2a\x00"
+$QEMU_IO -c "read 0 64k" "$TEST_IMG" | _filter_qemu_io
+
+# Test how well zero cluster expansion can cope with this
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l1_offset" "\x80\x00\x00\x00\x00\x04\x2a\x00"
+$QEMU_IMG amend -o compat=0.10 "$TEST_IMG"
+
+echo
+echo "=== Testing unaligned L2 entry ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l2_offset" "\x80\x00\x00\x00\x00\x05\x2a\x00"
+$QEMU_IO -c "read 0 64k" "$TEST_IMG" | _filter_qemu_io
+
+echo
+echo "=== Testing unaligned pre-allocated zero cluster ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l2_offset" "\x80\x00\x00\x00\x00\x05\x2a\x01"
+# zero cluster expansion
+$QEMU_IMG amend -o compat=0.10 "$TEST_IMG"
+
+echo
+echo "=== Testing unaligned reftable entry ==="
+echo
+_make_test_img 64M
+poke_file "$TEST_IMG" "$rt_offset" "\x00\x00\x00\x00\x00\x02\x2a\x00"
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+
+echo
+echo "=== Testing non-fatal corruption on freeing ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l2_offset" "\x80\x00\x00\x00\x00\x05\x2a\x00"
+$QEMU_IO -c "discard 0 64k" "$TEST_IMG" | _filter_qemu_io
+
+echo
+echo "=== Testing read-only corruption report ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 64k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l2_offset" "\x80\x00\x00\x00\x00\x05\x2a\x00"
+# Should only emit a single error message
+$QEMU_IO -c "$OPEN_RO" -c "read 0 64k" -c "read 0 64k" | _filter_qemu_io
+
+echo
+echo "=== Testing non-fatal and then fatal corruption report ==="
+echo
+_make_test_img 64M
+$QEMU_IO -c "write 0 128k" "$TEST_IMG" | _filter_qemu_io
+poke_file "$TEST_IMG" "$l2_offset"        "\x80\x00\x00\x00\x00\x05\x2a\x00"
+poke_file "$TEST_IMG" "$(($l2_offset+8))" "\x80\x00\x00\x00\x00\x06\x2a\x00"
+# Should emit two error messages
+$QEMU_IO -c "discard 0 64k" -c "read 64k 64k" "$TEST_IMG" | _filter_qemu_io
 
 # success, all done
 echo "*** done"

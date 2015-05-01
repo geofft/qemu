@@ -477,6 +477,23 @@ static const MemoryRegionPortio isa_parallel_portio_sw_list[] = {
     PORTIO_END_OF_LIST(),
 };
 
+
+static const VMStateDescription vmstate_parallel_isa = {
+    .name = "parallel_isa",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields      = (VMStateField[]) {
+        VMSTATE_UINT8(state.dataw, ISAParallelState),
+        VMSTATE_UINT8(state.datar, ISAParallelState),
+        VMSTATE_UINT8(state.status, ISAParallelState),
+        VMSTATE_UINT8(state.control, ISAParallelState),
+        VMSTATE_INT32(state.irq_pending, ISAParallelState),
+        VMSTATE_INT32(state.epp_timeout, ISAParallelState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+
 static void parallel_isa_realizefn(DeviceState *dev, Error **errp)
 {
     static int index;
@@ -595,7 +612,7 @@ bool parallel_mm_init(MemoryRegion *address_space,
 
 static Property parallel_isa_properties[] = {
     DEFINE_PROP_UINT32("index", ISAParallelState, index,   -1),
-    DEFINE_PROP_HEX32("iobase", ISAParallelState, iobase,  -1),
+    DEFINE_PROP_UINT32("iobase", ISAParallelState, iobase,  -1),
     DEFINE_PROP_UINT32("irq",   ISAParallelState, isairq,  7),
     DEFINE_PROP_CHR("chardev",  ISAParallelState, state.chr),
     DEFINE_PROP_END_OF_LIST(),
@@ -606,6 +623,7 @@ static void parallel_isa_class_initfn(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = parallel_isa_realizefn;
+    dc->vmsd = &vmstate_parallel_isa;
     dc->props = parallel_isa_properties;
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
@@ -623,3 +641,28 @@ static void parallel_register_types(void)
 }
 
 type_init(parallel_register_types)
+
+static void parallel_init(ISABus *bus, int index, CharDriverState *chr)
+{
+    DeviceState *dev;
+    ISADevice *isadev;
+
+    isadev = isa_create(bus, "isa-parallel");
+    dev = DEVICE(isadev);
+    qdev_prop_set_uint32(dev, "index", index);
+    qdev_prop_set_chr(dev, "chardev", chr);
+    qdev_init_nofail(dev);
+}
+
+void parallel_hds_isa_init(ISABus *bus, int n)
+{
+    int i;
+
+    assert(n <= MAX_PARALLEL_PORTS);
+
+    for (i = 0; i < n; i++) {
+        if (parallel_hds[i]) {
+            parallel_init(bus, i, parallel_hds[i]);
+        }
+    }
+}

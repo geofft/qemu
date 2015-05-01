@@ -15,7 +15,7 @@
 #include "strongarm.h"
 #include "hw/arm/arm.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
 
 static struct arm_boot_info collie_binfo = {
@@ -23,12 +23,12 @@ static struct arm_boot_info collie_binfo = {
     .ram_size = 0x20000000,
 };
 
-static void collie_init(QEMUMachineInitArgs *args)
+static void collie_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     StrongARMState *s;
     DriveInfo *dinfo;
     MemoryRegion *sysmem = get_system_memory();
@@ -41,13 +41,13 @@ static void collie_init(QEMUMachineInitArgs *args)
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
     pflash_cfi01_register(SA_CS0, NULL, "collie.fl1", 0x02000000,
-                    dinfo ? dinfo->bdrv : NULL, (64 * 1024),
-                    512, 4, 0x00, 0x00, 0x00, 0x00, 0);
+                    dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                    (64 * 1024), 512, 4, 0x00, 0x00, 0x00, 0x00, 0);
 
     dinfo = drive_get(IF_PFLASH, 0, 1);
     pflash_cfi01_register(SA_CS1, NULL, "collie.fl2", 0x02000000,
-                    dinfo ? dinfo->bdrv : NULL, (64 * 1024),
-                    512, 4, 0x00, 0x00, 0x00, 0x00, 0);
+                    dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                    (64 * 1024), 512, 4, 0x00, 0x00, 0x00, 0x00, 0);
 
     sysbus_create_simple("scoop", 0x40800000, NULL);
 

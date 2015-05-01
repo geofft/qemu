@@ -31,7 +31,7 @@
 #include "hw/boards.h"
 #include "hw/arm/arm.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/qtest.h"
 #include "exec/address-spaces.h"
 
@@ -98,7 +98,7 @@ static struct arm_boot_info sx1_binfo = {
     .board_id = 0x265,
 };
 
-static void sx1_init(QEMUMachineInitArgs *args, const int version)
+static void sx1_init(MachineState *machine, const int version)
 {
     struct omap_mpu_state_s *mpu;
     MemoryRegion *address_space = get_system_memory();
@@ -118,10 +118,12 @@ static void sx1_init(QEMUMachineInitArgs *args, const int version)
         flash_size = flash2_size;
     }
 
-    mpu = omap310_mpu_init(address_space, sx1_binfo.ram_size, args->cpu_model);
+    mpu = omap310_mpu_init(address_space, sx1_binfo.ram_size,
+                           machine->cpu_model);
 
     /* External Flash (EMIFS) */
-    memory_region_init_ram(flash, NULL, "omap_sx1.flash0-0", flash_size);
+    memory_region_init_ram(flash, NULL, "omap_sx1.flash0-0", flash_size,
+                           &error_abort);
     vmstate_register_ram_global(flash);
     memory_region_set_readonly(flash, true);
     memory_region_add_subregion(address_space, OMAP_CS0_BASE, flash);
@@ -152,8 +154,8 @@ static void sx1_init(QEMUMachineInitArgs *args, const int version)
     if ((dinfo = drive_get(IF_PFLASH, 0, fl_idx)) != NULL) {
         if (!pflash_cfi01_register(OMAP_CS0_BASE, NULL,
                                    "omap_sx1.flash0-1", flash_size,
-                                   dinfo->bdrv, sector_size,
-                                   flash_size / sector_size,
+                                   blk_by_legacy_dinfo(dinfo),
+                                   sector_size, flash_size / sector_size,
                                    4, 0, 0, 0, 0, be)) {
             fprintf(stderr, "qemu: Error registering flash memory %d.\n",
                            fl_idx);
@@ -163,7 +165,8 @@ static void sx1_init(QEMUMachineInitArgs *args, const int version)
 
     if ((version == 1) &&
             (dinfo = drive_get(IF_PFLASH, 0, fl_idx)) != NULL) {
-        memory_region_init_ram(flash_1, NULL, "omap_sx1.flash1-0", flash1_size);
+        memory_region_init_ram(flash_1, NULL, "omap_sx1.flash1-0", flash1_size,
+                               &error_abort);
         vmstate_register_ram_global(flash_1);
         memory_region_set_readonly(flash_1, true);
         memory_region_add_subregion(address_space, OMAP_CS1_BASE, flash_1);
@@ -175,8 +178,8 @@ static void sx1_init(QEMUMachineInitArgs *args, const int version)
 
         if (!pflash_cfi01_register(OMAP_CS1_BASE, NULL,
                                    "omap_sx1.flash1-1", flash1_size,
-                                   dinfo->bdrv, sector_size,
-                                   flash1_size / sector_size,
+                                   blk_by_legacy_dinfo(dinfo),
+                                   sector_size, flash1_size / sector_size,
                                    4, 0, 0, 0, 0, be)) {
             fprintf(stderr, "qemu: Error registering flash memory %d.\n",
                            fl_idx);
@@ -189,29 +192,29 @@ static void sx1_init(QEMUMachineInitArgs *args, const int version)
                                 OMAP_CS1_BASE, &cs[1]);
     }
 
-    if (!args->kernel_filename && !fl_idx && !qtest_enabled()) {
+    if (!machine->kernel_filename && !fl_idx && !qtest_enabled()) {
         fprintf(stderr, "Kernel or Flash image must be specified\n");
         exit(1);
     }
 
     /* Load the kernel.  */
-    sx1_binfo.kernel_filename = args->kernel_filename;
-    sx1_binfo.kernel_cmdline = args->kernel_cmdline;
-    sx1_binfo.initrd_filename = args->initrd_filename;
+    sx1_binfo.kernel_filename = machine->kernel_filename;
+    sx1_binfo.kernel_cmdline = machine->kernel_cmdline;
+    sx1_binfo.initrd_filename = machine->initrd_filename;
     arm_load_kernel(mpu->cpu, &sx1_binfo);
 
     /* TODO: fix next line */
     //~ qemu_console_resize(ds, 640, 480);
 }
 
-static void sx1_init_v1(QEMUMachineInitArgs *args)
+static void sx1_init_v1(MachineState *machine)
 {
-    sx1_init(args, 1);
+    sx1_init(machine, 1);
 }
 
-static void sx1_init_v2(QEMUMachineInitArgs *args)
+static void sx1_init_v2(MachineState *machine)
 {
-    sx1_init(args, 2);
+    sx1_init(machine, 2);
 }
 
 static QEMUMachine sx1_machine_v2 = {

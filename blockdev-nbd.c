@@ -10,6 +10,7 @@
  */
 
 #include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "hw/block/block.h"
 #include "monitor/monitor.h"
 #include "qapi/qmp/qerror.h"
@@ -27,8 +28,9 @@ static void nbd_accept(void *opaque)
     socklen_t addr_len = sizeof(addr);
 
     int fd = accept(server_fd, (struct sockaddr *)&addr, &addr_len);
-    if (fd >= 0) {
-        nbd_client_new(NULL, fd, nbd_client_put);
+    if (fd >= 0 && !nbd_client_new(NULL, fd, nbd_client_put)) {
+        shutdown(fd, 2);
+        close(fd);
     }
 }
 
@@ -45,8 +47,9 @@ void qmp_nbd_server_start(SocketAddress *addr, Error **errp)
     }
 }
 
-/* Hook into the BlockDriverState notifiers to close the export when
- * the file is closed.
+/*
+ * Hook into the BlockBackend notifiers to close the export when the
+ * backend is closed.
  */
 typedef struct NBDCloseNotifier {
     Notifier n;
@@ -72,7 +75,7 @@ static void nbd_close_notifier(Notifier *n, void *data)
 void qmp_nbd_server_add(const char *device, bool has_writable, bool writable,
                         Error **errp)
 {
-    BlockDriverState *bs;
+    BlockBackend *blk;
     NBDExport *exp;
     NBDCloseNotifier *n;
 
@@ -86,27 +89,35 @@ void qmp_nbd_server_add(const char *device, bool has_writable, bool writable,
         return;
     }
 
-    bs = bdrv_find(device);
-    if (!bs) {
+    blk = blk_by_name(device);
+    if (!blk) {
         error_set(errp, QERR_DEVICE_NOT_FOUND, device);
+        return;
+    }
+    if (!blk_is_inserted(blk)) {
+        error_set(errp, QERR_DEVICE_HAS_NO_MEDIUM, device);
         return;
     }
 
     if (!has_writable) {
         writable = false;
     }
-    if (bdrv_is_read_only(bs)) {
+    if (blk_is_read_only(blk)) {
         writable = false;
     }
 
-    exp = nbd_export_new(bs, 0, -1, writable ? 0 : NBD_FLAG_READ_ONLY, NULL);
+    exp = nbd_export_new(blk, 0, -1, writable ? 0 : NBD_FLAG_READ_ONLY, NULL,
+                         errp);
+    if (!exp) {
+        return;
+    }
 
     nbd_export_set_name(exp, device);
 
-    n = g_malloc0(sizeof(NBDCloseNotifier));
+    n = g_new0(NBDCloseNotifier, 1);
     n->n.notify = nbd_close_notifier;
     n->exp = exp;
-    bdrv_add_close_notifier(bs, &n->n);
+    blk_add_close_notifier(blk, &n->n);
     QTAILQ_INSERT_TAIL(&close_notifiers, n, next);
 }
 

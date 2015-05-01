@@ -236,6 +236,10 @@ int bdrv_snapshot_delete(BlockDriverState *bs,
         error_setg(errp, "snapshot_id and name are both NULL");
         return -EINVAL;
     }
+
+    /* drain all pending i/o before deleting snapshot */
+    bdrv_drain_all();
+
     if (drv->bdrv_snapshot_delete) {
         return drv->bdrv_snapshot_delete(bs, snapshot_id, name, errp);
     }
@@ -345,7 +349,7 @@ int bdrv_snapshot_load_tmp_by_id_or_name(BlockDriverState *bs,
         ret = bdrv_snapshot_load_tmp(bs, NULL, id_or_name, &local_err);
     }
 
-    if (error_is_set(&local_err)) {
+    if (local_err) {
         error_propagate(errp, local_err);
     }
 

@@ -20,7 +20,7 @@
 #include "hw/boards.h"
 #include "sysemu/sysemu.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "ui/console.h"
 #include "audio/audio.h"
 #include "exec/address-spaces.h"
@@ -33,7 +33,7 @@
 #define DPRINTF(fmt, ...)
 #endif
 
-static struct keymap map[0x100] = {
+static const struct keymap map[0x100] = {
     [0 ... 0xff] = { -1, -1 },
     [0x3b] = {0, 0}, /* Option = F1 */
     [0xc8] = {0, 1}, /* Up */
@@ -164,7 +164,6 @@ static VMStateDescription vmstate_zipit_lcd_state = {
     .name = "zipit-lcd",
     .version_id = 2,
     .minimum_version_id = 2,
-    .minimum_version_id_old = 2,
     .fields = (VMStateField[]) {
         VMSTATE_SSI_SLAVE(ssidev, ZipitLCD),
         VMSTATE_INT32(selected, ZipitLCD),
@@ -193,15 +192,20 @@ static const TypeInfo zipit_lcd_info = {
     .class_init    = zipit_lcd_class_init,
 };
 
-typedef struct {
-    I2CSlave i2c;
+#define TYPE_AER915 "aer915"
+#define AER915(obj) OBJECT_CHECK(AER915State, (obj), TYPE_AER915)
+
+typedef struct AER915State {
+    I2CSlave parent_obj;
+
     int len;
     uint8_t buf[3];
 } AER915State;
 
 static int aer915_send(I2CSlave *i2c, uint8_t data)
 {
-    AER915State *s = FROM_I2C_SLAVE(AER915State, i2c);
+    AER915State *s = AER915(i2c);
+
     s->buf[s->len] = data;
     if (s->len++ > 2) {
         DPRINTF("%s: message too long (%i bytes)\n",
@@ -219,7 +223,8 @@ static int aer915_send(I2CSlave *i2c, uint8_t data)
 
 static void aer915_event(I2CSlave *i2c, enum i2c_event event)
 {
-    AER915State *s = FROM_I2C_SLAVE(AER915State, i2c);
+    AER915State *s = AER915(i2c);
+
     switch (event) {
     case I2C_START_SEND:
         s->len = 0;
@@ -238,8 +243,8 @@ static void aer915_event(I2CSlave *i2c, enum i2c_event event)
 
 static int aer915_recv(I2CSlave *slave)
 {
+    AER915State *s = AER915(slave);
     int retval = 0x00;
-    AER915State *s = FROM_I2C_SLAVE(AER915State, slave);
 
     switch (s->buf[0]) {
     /* Return hardcoded battery voltage,
@@ -269,7 +274,6 @@ static VMStateDescription vmstate_aer915_state = {
     .name = "aer915",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_INT32(len, AER915State),
         VMSTATE_BUFFER(buf, AER915State),
@@ -290,25 +294,25 @@ static void aer915_class_init(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo aer915_info = {
-    .name          = "aer915",
+    .name          = TYPE_AER915,
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(AER915State),
     .class_init    = aer915_class_init,
 };
 
-static void z2_init(QEMUMachineInitArgs *args)
+static void z2_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     MemoryRegion *address_space_mem = get_system_memory();
     uint32_t sector_len = 0x10000;
     PXA2xxState *mpu;
     DriveInfo *dinfo;
     int be;
     void *z2_lcd;
-    i2c_bus *bus;
+    I2CBus *bus;
     DeviceState *wm;
 
     if (!cpu_model) {
@@ -332,9 +336,9 @@ static void z2_init(QEMUMachineInitArgs *args)
 
     if (!pflash_cfi01_register(Z2_FLASH_BASE,
                                NULL, "z2.flash0", Z2_FLASH_SIZE,
-                               dinfo ? dinfo->bdrv : NULL, sector_len,
-                               Z2_FLASH_SIZE / sector_len, 4, 0, 0, 0, 0,
-                               be)) {
+                               dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                               sector_len, Z2_FLASH_SIZE / sector_len,
+                               4, 0, 0, 0, 0, be)) {
         fprintf(stderr, "qemu: Error registering flash memory.\n");
         exit(1);
     }
@@ -351,7 +355,7 @@ static void z2_init(QEMUMachineInitArgs *args)
     type_register_static(&aer915_info);
     z2_lcd = ssi_create_slave(mpu->ssp[1], "zipit-lcd");
     bus = pxa2xx_i2c_bus(mpu->i2c[0]);
-    i2c_create_slave(bus, "aer915", 0x55);
+    i2c_create_slave(bus, TYPE_AER915, 0x55);
     wm = i2c_create_slave(bus, "wm8750", 0x1b);
     mpu->i2s->opaque = wm;
     mpu->i2s->codec_out = wm8750_dac_dat;
@@ -359,7 +363,7 @@ static void z2_init(QEMUMachineInitArgs *args)
     wm8750_data_req_set(wm, mpu->i2s->data_req, mpu->i2s);
 
     qdev_connect_gpio_out(mpu->gpio, Z2_GPIO_LCD_CS,
-        qemu_allocate_irqs(z2_lcd_cs, z2_lcd, 1)[0]);
+                          qemu_allocate_irq(z2_lcd_cs, z2_lcd, 0));
 
     z2_binfo.kernel_filename = kernel_filename;
     z2_binfo.kernel_cmdline = kernel_cmdline;

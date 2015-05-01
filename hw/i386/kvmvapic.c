@@ -59,6 +59,7 @@ typedef struct VAPICROMState {
     GuestROMState rom_state;
     size_t rom_size;
     bool rom_mapped_writable;
+    VMChangeStateEntry *vmsentry;
 } VAPICROMState;
 
 #define TYPE_VAPIC "kvmvapic"
@@ -124,14 +125,14 @@ static const TPRInstruction tpr_instr[] = {
 
 static void read_guest_rom_state(VAPICROMState *s)
 {
-    cpu_physical_memory_rw(s->rom_state_paddr, (void *)&s->rom_state,
-                           sizeof(GuestROMState), 0);
+    cpu_physical_memory_read(s->rom_state_paddr, &s->rom_state,
+                             sizeof(GuestROMState));
 }
 
 static void write_guest_rom_state(VAPICROMState *s)
 {
-    cpu_physical_memory_rw(s->rom_state_paddr, (void *)&s->rom_state,
-                           sizeof(GuestROMState), 1);
+    cpu_physical_memory_write(s->rom_state_paddr, &s->rom_state,
+                              sizeof(GuestROMState));
 }
 
 static void update_guest_rom_state(VAPICROMState *s)
@@ -311,16 +312,14 @@ static int update_rom_mapping(VAPICROMState *s, CPUX86State *env, target_ulong i
     for (pos = le32_to_cpu(s->rom_state.fixup_start);
          pos < le32_to_cpu(s->rom_state.fixup_end);
          pos += 4) {
-        cpu_physical_memory_rw(paddr + pos - s->rom_state.vaddr,
-                               (void *)&offset, sizeof(offset), 0);
+        cpu_physical_memory_read(paddr + pos - s->rom_state.vaddr,
+                                 &offset, sizeof(offset));
         offset = le32_to_cpu(offset);
-        cpu_physical_memory_rw(paddr + offset, (void *)&patch,
-                               sizeof(patch), 0);
+        cpu_physical_memory_read(paddr + offset, &patch, sizeof(patch));
         patch = le32_to_cpu(patch);
         patch += rom_state_vaddr - le32_to_cpu(s->rom_state.vaddr);
         patch = cpu_to_le32(patch);
-        cpu_physical_memory_rw(paddr + offset, (void *)&patch,
-                               sizeof(patch), 1);
+        cpu_physical_memory_write(paddr + offset, &patch, sizeof(patch));
     }
     read_guest_rom_state(s);
     s->vapic_paddr = paddr + le32_to_cpu(s->rom_state.vapic_vaddr) -
@@ -364,9 +363,9 @@ static int vapic_enable(VAPICROMState *s, X86CPU *cpu)
     }
     vapic_paddr = s->vapic_paddr +
         (((hwaddr)cpu_number) << VAPIC_CPU_SHIFT);
-    cpu_physical_memory_rw(vapic_paddr + offsetof(VAPICState, enabled),
-                           (void *)&enabled, sizeof(enabled), 1);
-    apic_enable_vapic(cpu->env.apic_state, vapic_paddr);
+    cpu_physical_memory_write(vapic_paddr + offsetof(VAPICState, enabled),
+                              &enabled, sizeof(enabled));
+    apic_enable_vapic(cpu->apic_state, vapic_paddr);
 
     s->state = VAPIC_ACTIVE;
 
@@ -406,7 +405,6 @@ static void patch_instruction(VAPICROMState *s, X86CPU *cpu, target_ulong ip)
     }
 
     if (!kvm_enabled()) {
-        cpu_restore_state(env, env->mem_io_pc);
         cpu_get_tb_cpu_state(env, &current_pc, &current_cs_base,
                              &current_flags);
     }
@@ -448,8 +446,8 @@ static void patch_instruction(VAPICROMState *s, X86CPU *cpu, target_ulong ip)
 
     if (!kvm_enabled()) {
         cs->current_tb = NULL;
-        tb_gen_code(env, current_pc, current_cs_base, current_flags, 1);
-        cpu_resume_from_signal(env, NULL);
+        tb_gen_code(cs, current_pc, current_cs_base, current_flags, 1);
+        cpu_resume_from_signal(cs, NULL);
     }
 }
 
@@ -496,12 +494,10 @@ static void vapic_enable_tpr_reporting(bool enable)
     };
     CPUState *cs;
     X86CPU *cpu;
-    CPUX86State *env;
 
     CPU_FOREACH(cs) {
         cpu = X86_CPU(cs);
-        env = &cpu->env;
-        info.apic = env->apic_state;
+        info.apic = cpu->apic_state;
         run_on_cpu(cs, vapic_do_enable_tpr_reporting, &info);
     }
 }
@@ -537,7 +533,7 @@ static int patch_hypercalls(VAPICROMState *s)
     uint8_t *rom;
 
     rom = g_malloc(s->rom_size);
-    cpu_physical_memory_rw(rom_paddr, rom, s->rom_size, 0);
+    cpu_physical_memory_read(rom_paddr, rom, s->rom_size);
 
     for (pos = 0; pos < s->rom_size - sizeof(vmcall_pattern); pos++) {
         if (kvm_irqchip_in_kernel()) {
@@ -553,8 +549,7 @@ static int patch_hypercalls(VAPICROMState *s)
         }
         if (memcmp(rom + pos, pattern, 7) == 0 &&
             (rom[pos + 7] == alternates[0] || rom[pos + 7] == alternates[1])) {
-            cpu_physical_memory_rw(rom_paddr + pos + 5, (uint8_t *)patch,
-                                   3, 1);
+            cpu_physical_memory_write(rom_paddr + pos + 5, patch, 3);
             /*
              * Don't flush the tb here. Under ordinary conditions, the patched
              * calls are miles away from the current IP. Under malicious
@@ -589,7 +584,7 @@ static int vapic_map_rom_writable(VAPICROMState *s)
 
     if (s->rom_mapped_writable) {
         memory_region_del_subregion(as, &s->rom);
-        memory_region_destroy(&s->rom);
+        object_unparent(OBJECT(&s->rom));
     }
 
     /* grab RAM memory region (region @rom_paddr may still be pc.rom) */
@@ -700,7 +695,7 @@ static void vapic_write(void *opaque, hwaddr addr, uint64_t data,
     default:
     case 4:
         if (!kvm_irqchip_in_kernel()) {
-            apic_poll_irq(env->apic_state);
+            apic_poll_irq(cpu->apic_state);
         }
         break;
     }
@@ -736,13 +731,40 @@ static void do_vapic_enable(void *data)
     VAPICROMState *s = data;
     X86CPU *cpu = X86_CPU(first_cpu);
 
-    vapic_enable(s, cpu);
+    static const uint8_t enabled = 1;
+    cpu_physical_memory_write(s->vapic_paddr + offsetof(VAPICState, enabled),
+                              &enabled, sizeof(enabled));
+    apic_enable_vapic(cpu->apic_state, s->vapic_paddr);
+    s->state = VAPIC_ACTIVE;
+}
+
+static void kvmvapic_vm_state_change(void *opaque, int running,
+                                     RunState state)
+{
+    VAPICROMState *s = opaque;
+    uint8_t *zero;
+
+    if (!running) {
+        return;
+    }
+
+    if (s->state == VAPIC_ACTIVE) {
+        if (smp_cpus == 1) {
+            run_on_cpu(first_cpu, do_vapic_enable, s);
+        } else {
+            zero = g_malloc0(s->rom_state.vapic_size);
+            cpu_physical_memory_write(s->vapic_paddr, zero,
+                                      s->rom_state.vapic_size);
+            g_free(zero);
+        }
+    }
+
+    qemu_del_vm_change_state_handler(s->vmsentry);
 }
 
 static int vapic_post_load(void *opaque, int version_id)
 {
     VAPICROMState *s = opaque;
-    uint8_t *zero;
 
     /*
      * The old implementation of qemu-kvm did not provide the state
@@ -757,17 +779,11 @@ static int vapic_post_load(void *opaque, int version_id)
             return -1;
         }
     }
-    if (s->state == VAPIC_ACTIVE) {
-        if (smp_cpus == 1) {
-            run_on_cpu(first_cpu, do_vapic_enable, s);
-        } else {
-            zero = g_malloc0(s->rom_state.vapic_size);
-            cpu_physical_memory_rw(s->vapic_paddr, zero,
-                                   s->rom_state.vapic_size, 1);
-            g_free(zero);
-        }
-    }
 
+    if (!s->vmsentry) {
+        s->vmsentry =
+            qemu_add_vm_change_state_handler(kvmvapic_vm_state_change, s);
+    }
     return 0;
 }
 
@@ -775,7 +791,6 @@ static const VMStateDescription vmstate_handlers = {
     .name = "kvmvapic-handlers",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(set_tpr, VAPICHandlers),
         VMSTATE_UINT32(set_tpr_eax, VAPICHandlers),
@@ -789,7 +804,6 @@ static const VMStateDescription vmstate_guest_rom = {
     .name = "kvmvapic-guest-rom",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UNUSED(8),     /* signature */
         VMSTATE_UINT32(vaddr, GuestROMState),
@@ -809,7 +823,6 @@ static const VMStateDescription vmstate_vapic = {
     .name = "kvm-tpr-opt",      /* compatible with qemu-kvm VAPIC */
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = vapic_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_STRUCT(rom_state, VAPICROMState, 0, vmstate_guest_rom,
@@ -827,7 +840,6 @@ static void vapic_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->no_user = 1;
     dc->reset   = vapic_reset;
     dc->vmsd    = &vmstate_vapic;
     dc->realize = vapic_realize;

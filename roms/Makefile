@@ -31,6 +31,7 @@ find-cross-gcc = $(firstword $(wildcard $(patsubst %ld,%gcc,$(call find-cross-ld
 find-cross-prefix = $(subst gcc,,$(notdir $(call find-cross-gcc,$(1))))
 
 powerpc64_cross_prefix := $(call find-cross-prefix,powerpc64)
+powerpc_cross_prefix := $(call find-cross-prefix,powerpc)
 x86_64_cross_prefix := $(call find-cross-prefix,x86_64)
 
 #
@@ -55,6 +56,7 @@ default:
 	@echo "  efirom         -- update nic roms (bios+efi, this needs"
 	@echo "                    the EfiRom utility from edk2 / tianocore)"
 	@echo "  slof           -- update slof.bin"
+	@echo "  u-boot.e500    -- update u-boot.e500"
 
 bios: build-seabios-config-seabios-128k build-seabios-config-seabios-256k
 	cp seabios/builds/seabios-128k/bios.bin ../pc-bios/bios.bin
@@ -72,11 +74,11 @@ seavgabios-%: build-seabios-config-vga-%
 build-seabios-config-%: config.%
 	mkdir -p seabios/builds/$*
 	cp $< seabios/builds/$*/.config
-	$(MAKE) $(MAKEFLAGS) -C seabios \
+	$(MAKE) -C seabios \
 		CROSS_COMPILE=$(x86_64_cross_prefix) \
 		KCONFIG_CONFIG=$(CURDIR)/seabios/builds/$*/.config \
 		OUT=$(CURDIR)/seabios/builds/$*/ oldnoconfig
-	$(MAKE) $(MAKEFLAGS) -C seabios \
+	$(MAKE) -C seabios \
 		CROSS_COMPILE=$(x86_64_cross_prefix) \
 		KCONFIG_CONFIG=$(CURDIR)/seabios/builds/$*/.config \
 		OUT=$(CURDIR)/seabios/builds/$*/ all
@@ -90,12 +92,12 @@ lgplvgabios-%: build-lgplvgabios
 	cp vgabios/VGABIOS-lgpl-latest.$*.bin ../pc-bios/vgabios-$*.bin
 
 build-lgplvgabios:
-	$(MAKE) $(MAKEFLAGS) -C vgabios $(vgabios_targets)
+	$(MAKE) -C vgabios $(vgabios_targets)
 
 
 .PHONY: sgabios
 sgabios:
-	$(MAKE) $(MAKEFLAGS) -C sgabios
+	$(MAKE) -C sgabios
 	cp sgabios/sgabios.bin ../pc-bios
 
 
@@ -114,12 +116,12 @@ efi-rom-%: build-pxe-roms build-efi-roms
 		-o ../pc-bios/efi-$*.rom
 
 build-pxe-roms: ipxe/src/config/local/general.h
-	$(MAKE) $(MAKEFLAGS) -C ipxe/src GITVERSION="" \
+	$(MAKE) -C ipxe/src GITVERSION="" \
 		CROSS_COMPILE=$(x86_64_cross_prefix) \
 		$(patsubst %,bin/%.rom,$(pxerom_targets))
 
 build-efi-roms: build-pxe-roms ipxe/src/config/local/general.h
-	$(MAKE) $(MAKEFLAGS) -C ipxe/src GITVERSION="" \
+	$(MAKE) -C ipxe/src GITVERSION="" \
 		CROSS_COMPILE=$(x86_64_cross_prefix) \
 		$(patsubst %,bin-i386-efi/%.efidrv,$(pxerom_targets)) \
 		$(patsubst %,bin-x86_64-efi/%.efidrv,$(pxerom_targets))
@@ -129,15 +131,22 @@ ipxe/src/config/local/%: config.ipxe.%
 
 
 slof:
-	$(MAKE) $(MAKEFLAGS) -C SLOF CROSS=$(powerpc64_cross_prefix) qemu
+	$(MAKE) -C SLOF CROSS=$(powerpc64_cross_prefix) qemu
 	cp SLOF/boot_rom.bin ../pc-bios/slof.bin
 
+u-boot.e500:
+	$(MAKE) -C u-boot O=build.e500 qemu-ppce500_config
+	$(MAKE) -C u-boot CROSS_COMPILE=$(powerpc_cross_prefix) \
+		O=build.e500
+	$(powerpc_cross_prefix)strip u-boot/build.e500/u-boot -o \
+		../pc-bios/u-boot.e500
 
 clean:
 	rm -rf seabios/.config seabios/out seabios/builds
-	$(MAKE) $(MAKEFLAGS) -C vgabios clean
+	$(MAKE) -C vgabios clean
 	rm -f vgabios/VGABIOS-lgpl-latest*
-	$(MAKE) $(MAKEFLAGS) -C sgabios clean
+	$(MAKE) -C sgabios clean
 	rm -f sgabios/.depend
-	$(MAKE) $(MAKEFLAGS) -C ipxe/src veryclean
-	$(MAKE) $(MAKEFLAGS) -C SLOF clean
+	$(MAKE) -C ipxe/src veryclean
+	$(MAKE) -C SLOF clean
+	rm -rf u-boot/build.e500

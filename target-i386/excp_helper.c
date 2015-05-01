@@ -20,7 +20,7 @@
 #include "cpu.h"
 #include "qemu/log.h"
 #include "sysemu/sysemu.h"
-#include "helper.h"
+#include "exec/helper-proto.h"
 
 #if 0
 #define raise_exception_err(env, a, b)                                  \
@@ -64,8 +64,20 @@ static int check_exception(CPUX86State *env, int intno, int *error_code)
 
         qemu_log_mask(CPU_LOG_RESET, "Triple fault\n");
 
+#if 0
         qemu_system_reset_request();
         return EXCP_HLT;
+#else
+        /*
+         * QEMU traditionally resets the machine on triple fault
+         * because programs written for 286 protected mode would exit
+         * protected mode by intentionally triple faulting the machine
+         * (after setting the boot vector to point to their code).
+         * This sucks for debugging programs that were written after
+         * 1985, so we instead halt the machine for inspection.
+         */
+        return EXCP_TRIPLE;
+#endif
     }
 #endif
 
@@ -94,6 +106,8 @@ static void QEMU_NORETURN raise_interrupt2(CPUX86State *env, int intno,
                                            int is_int, int error_code,
                                            int next_eip_addend)
 {
+    CPUState *cs = CPU(x86_env_get_cpu(env));
+
     if (!is_int) {
         cpu_svm_check_intercept_param(env, SVM_EXIT_EXCP_BASE + intno,
                                       error_code);
@@ -102,11 +116,11 @@ static void QEMU_NORETURN raise_interrupt2(CPUX86State *env, int intno,
         cpu_svm_check_intercept_param(env, SVM_EXIT_SWINT, 0);
     }
 
-    env->exception_index = intno;
+    cs->exception_index = intno;
     env->error_code = error_code;
     env->exception_is_int = is_int;
     env->exception_next_eip = env->eip + next_eip_addend;
-    cpu_loop_exit(env);
+    cpu_loop_exit(cs);
 }
 
 /* shortcuts to generate exceptions */

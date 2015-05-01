@@ -60,19 +60,17 @@ void vty_putchars(VIOsPAPRDevice *sdev, uint8_t *buf, int len)
     qemu_chr_fe_write(dev->chardev, buf, len);
 }
 
-static int spapr_vty_init(VIOsPAPRDevice *sdev)
+static void spapr_vty_realize(VIOsPAPRDevice *sdev, Error **errp)
 {
     VIOsPAPRVTYDevice *dev = VIO_SPAPR_VTY_DEVICE(sdev);
 
     if (!dev->chardev) {
-        fprintf(stderr, "spapr-vty: Can't create vty without a chardev!\n");
-        exit(1);
+        error_setg(errp, "chardev property not set");
+        return;
     }
 
     qemu_chr_add_handlers(dev->chardev, vty_can_receive,
                           vty_receive, NULL, dev);
-
-    return 0;
 }
 
 /* Forward declaration */
@@ -148,8 +146,7 @@ static const VMStateDescription vmstate_spapr_vty = {
     .name = "spapr_vty",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_SPAPR_VIO(sdev, VIOsPAPRVTYDevice),
 
         VMSTATE_UINT32(in, VIOsPAPRVTYDevice),
@@ -164,7 +161,7 @@ static void spapr_vty_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     VIOsPAPRDeviceClass *k = VIO_SPAPR_DEVICE_CLASS(klass);
 
-    k->init = spapr_vty_init;
+    k->realize = spapr_vty_realize;
     k->dt_name = "vty";
     k->dt_type = "serial";
     k->dt_compatible = "hvterm1";

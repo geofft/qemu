@@ -7,7 +7,7 @@
  *               VA Linux Systems Japan K.K.
  * Copyright (C) 2012 Jason Baron <jbaron@redhat.com>
  *
- * This is based on piix_pci.c, but heavily modified.
+ * This is based on piix.c, but heavily modified.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -47,10 +47,6 @@ static void q35_host_realize(DeviceState *dev, Error **errp)
     sysbus_add_io(sbd, MCH_HOST_BRIDGE_CONFIG_DATA, &pci->data_mem);
     sysbus_init_ioports(sbd, MCH_HOST_BRIDGE_CONFIG_DATA, 4);
 
-    if (pcie_host_init(PCIE_HOST_BRIDGE(s)) < 0) {
-        error_setg(errp, "failed to initialize pcie host");
-        return;
-    }
     pci->bus = pci_bus_new(DEVICE(s), "pcie.0",
                            s->mch.pci_address_space, s->mch.address_space_io,
                            0, TYPE_PCIE_BUS);
@@ -272,7 +268,7 @@ static void mch_update_smram(MCHPCIState *mch)
     PCIDevice *pd = PCI_DEVICE(mch);
 
     memory_region_transaction_begin();
-    smram_update(&mch->smram_region, pd->config[MCH_HOST_BRDIGE_SMRAM],
+    smram_update(&mch->smram_region, pd->config[MCH_HOST_BRIDGE_SMRAM],
                     mch->smm_enabled);
     memory_region_transaction_commit();
 }
@@ -283,7 +279,7 @@ static void mch_set_smm(int smm, void *arg)
     PCIDevice *pd = PCI_DEVICE(mch);
 
     memory_region_transaction_begin();
-    smram_set_smm(&mch->smm_enabled, smm, pd->config[MCH_HOST_BRDIGE_SMRAM],
+    smram_set_smm(&mch->smm_enabled, smm, pd->config[MCH_HOST_BRIDGE_SMRAM],
                     &mch->smram_region);
     memory_region_transaction_commit();
 }
@@ -306,8 +302,8 @@ static void mch_write_config(PCIDevice *d,
         mch_update_pciexbar(mch);
     }
 
-    if (ranges_overlap(address, len, MCH_HOST_BRDIGE_SMRAM,
-                       MCH_HOST_BRDIGE_SMRAM_SIZE)) {
+    if (ranges_overlap(address, len, MCH_HOST_BRIDGE_SMRAM,
+                       MCH_HOST_BRIDGE_SMRAM_SIZE)) {
         mch_update_smram(mch);
     }
 }
@@ -330,9 +326,8 @@ static const VMStateDescription vmstate_mch = {
     .name = "mch",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = mch_post_load,
-    .fields = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, MCHPCIState),
         VMSTATE_UINT8(smm_enabled, MCHPCIState),
         VMSTATE_END_OF_LIST()
@@ -347,12 +342,55 @@ static void mch_reset(DeviceState *qdev)
     pci_set_quad(d->config + MCH_HOST_BRIDGE_PCIEXBAR,
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
 
-    d->config[MCH_HOST_BRDIGE_SMRAM] = MCH_HOST_BRIDGE_SMRAM_DEFAULT;
+    d->config[MCH_HOST_BRIDGE_SMRAM] = MCH_HOST_BRIDGE_SMRAM_DEFAULT;
 
     mch_update(mch);
 }
 
-static int mch_init(PCIDevice *d)
+static AddressSpace *q35_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
+{
+    IntelIOMMUState *s = opaque;
+    VTDAddressSpace **pvtd_as;
+    int bus_num = pci_bus_num(bus);
+
+    assert(0 <= bus_num && bus_num <= VTD_PCI_BUS_MAX);
+    assert(0 <= devfn && devfn <= VTD_PCI_DEVFN_MAX);
+
+    pvtd_as = s->address_spaces[bus_num];
+    if (!pvtd_as) {
+        /* No corresponding free() */
+        pvtd_as = g_malloc0(sizeof(VTDAddressSpace *) * VTD_PCI_DEVFN_MAX);
+        s->address_spaces[bus_num] = pvtd_as;
+    }
+    if (!pvtd_as[devfn]) {
+        pvtd_as[devfn] = g_malloc0(sizeof(VTDAddressSpace));
+
+        pvtd_as[devfn]->bus_num = (uint8_t)bus_num;
+        pvtd_as[devfn]->devfn = (uint8_t)devfn;
+        pvtd_as[devfn]->iommu_state = s;
+        pvtd_as[devfn]->context_cache_entry.context_cache_gen = 0;
+        memory_region_init_iommu(&pvtd_as[devfn]->iommu, OBJECT(s),
+                                 &s->iommu_ops, "intel_iommu", UINT64_MAX);
+        address_space_init(&pvtd_as[devfn]->as,
+                           &pvtd_as[devfn]->iommu, "intel_iommu");
+    }
+    return &pvtd_as[devfn]->as;
+}
+
+static void mch_init_dmar(MCHPCIState *mch)
+{
+    PCIBus *pci_bus = PCI_BUS(qdev_get_parent_bus(DEVICE(mch)));
+
+    mch->iommu = INTEL_IOMMU_DEVICE(qdev_create(NULL, TYPE_INTEL_IOMMU_DEVICE));
+    object_property_add_child(OBJECT(mch), "intel-iommu",
+                              OBJECT(mch->iommu), NULL);
+    qdev_init_nofail(DEVICE(mch->iommu));
+    sysbus_mmio_map(SYS_BUS_DEVICE(mch->iommu), 0, Q35_HOST_BRIDGE_IOMMU_ADDR);
+
+    pci_setup_iommu(pci_bus, q35_host_dma_iommu, mch->iommu);
+}
+
+static void mch_realize(PCIDevice *d, Error **errp)
 {
     int i;
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
@@ -368,14 +406,18 @@ static int mch_init(PCIDevice *d)
     memory_region_add_subregion_overlap(mch->system_memory, 0xa0000,
                                         &mch->smram_region, 1);
     memory_region_set_enabled(&mch->smram_region, false);
-    init_pam(DEVICE(mch), mch->ram_memory, mch->system_memory, mch->pci_address_space,
-             &mch->pam_regions[0], PAM_BIOS_BASE, PAM_BIOS_SIZE);
+    init_pam(DEVICE(mch), mch->ram_memory, mch->system_memory,
+             mch->pci_address_space, &mch->pam_regions[0],
+             PAM_BIOS_BASE, PAM_BIOS_SIZE);
     for (i = 0; i < 12; ++i) {
-        init_pam(DEVICE(mch), mch->ram_memory, mch->system_memory, mch->pci_address_space,
-                 &mch->pam_regions[i+1], PAM_EXPAN_BASE + i * PAM_EXPAN_SIZE,
-                 PAM_EXPAN_SIZE);
+        init_pam(DEVICE(mch), mch->ram_memory, mch->system_memory,
+                 mch->pci_address_space, &mch->pam_regions[i+1],
+                 PAM_EXPAN_BASE + i * PAM_EXPAN_SIZE, PAM_EXPAN_SIZE);
     }
-    return 0;
+    /* Intel IOMMU (VT-d) */
+    if (machine_iommu(current_machine)) {
+        mch_init_dmar(mch);
+    }
 }
 
 uint64_t mch_mcfg_base(void)
@@ -393,7 +435,7 @@ static void mch_class_init(ObjectClass *klass, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init = mch_init;
+    k->realize = mch_realize;
     k->config_write = mch_write_config;
     dc->reset = mch_reset;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
@@ -403,6 +445,11 @@ static void mch_class_init(ObjectClass *klass, void *data)
     k->device_id = PCI_DEVICE_ID_INTEL_Q35_MCH;
     k->revision = MCH_HOST_BRIDGE_REVISION_DEFAULT;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo mch_info = {

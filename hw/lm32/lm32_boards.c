@@ -23,7 +23,7 @@
 #include "hw/devices.h"
 #include "hw/boards.h"
 #include "hw/loader.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "elf.h"
 #include "lm32_hwsetup.h"
 #include "lm32.h"
@@ -69,10 +69,10 @@ static void main_cpu_reset(void *opaque)
     env->deba = reset_info->flash_base;
 }
 
-static void lm32_evr_init(QEMUMachineInitArgs *args)
+static void lm32_evr_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
     LM32CPU *cpu;
     CPULM32State *env;
     DriveInfo *dinfo;
@@ -101,21 +101,26 @@ static void lm32_evr_init(QEMUMachineInitArgs *args)
         cpu_model = "lm32-full";
     }
     cpu = cpu_lm32_init(cpu_model);
+    if (cpu == NULL) {
+        fprintf(stderr, "qemu: unable to find CPU '%s'\n", cpu_model);
+        exit(1);
+    }
+
     env = &cpu->env;
     reset_info->cpu = cpu;
 
     reset_info->flash_base = flash_base;
 
-    memory_region_init_ram(phys_ram, NULL, "lm32_evr.sdram", ram_size);
-    vmstate_register_ram_global(phys_ram);
+    memory_region_allocate_system_memory(phys_ram, NULL, "lm32_evr.sdram",
+                                         ram_size);
     memory_region_add_subregion(address_space_mem, ram_base, phys_ram);
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
     /* Spansion S29NS128P */
     pflash_cfi02_register(flash_base, NULL, "lm32_evr.flash", flash_size,
-                          dinfo ? dinfo->bdrv : NULL, flash_sector_size,
-                          flash_size / flash_sector_size, 1, 2,
-                          0x01, 0x7e, 0x43, 0x00, 0x555, 0x2aa, 1);
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          flash_sector_size, flash_size / flash_sector_size,
+                          1, 2, 0x01, 0x7e, 0x43, 0x00, 0x555, 0x2aa, 1);
 
     /* create irq lines */
     cpu_irq = qemu_allocate_irqs(cpu_irq_handler, cpu, 1);
@@ -157,12 +162,12 @@ static void lm32_evr_init(QEMUMachineInitArgs *args)
     qemu_register_reset(main_cpu_reset, reset_info);
 }
 
-static void lm32_uclinux_init(QEMUMachineInitArgs *args)
+static void lm32_uclinux_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     LM32CPU *cpu;
     CPULM32State *env;
     DriveInfo *dinfo;
@@ -198,21 +203,26 @@ static void lm32_uclinux_init(QEMUMachineInitArgs *args)
         cpu_model = "lm32-full";
     }
     cpu = cpu_lm32_init(cpu_model);
+    if (cpu == NULL) {
+        fprintf(stderr, "qemu: unable to find CPU '%s'\n", cpu_model);
+        exit(1);
+    }
+
     env = &cpu->env;
     reset_info->cpu = cpu;
 
     reset_info->flash_base = flash_base;
 
-    memory_region_init_ram(phys_ram, NULL, "lm32_uclinux.sdram", ram_size);
-    vmstate_register_ram_global(phys_ram);
+    memory_region_allocate_system_memory(phys_ram, NULL,
+                                         "lm32_uclinux.sdram", ram_size);
     memory_region_add_subregion(address_space_mem, ram_base, phys_ram);
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
     /* Spansion S29NS128P */
     pflash_cfi02_register(flash_base, NULL, "lm32_uclinux.flash", flash_size,
-                          dinfo ? dinfo->bdrv : NULL, flash_sector_size,
-                          flash_size / flash_sector_size, 1, 2,
-                          0x01, 0x7e, 0x43, 0x00, 0x555, 0x2aa, 1);
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          flash_sector_size, flash_size / flash_sector_size,
+                          1, 2, 0x01, 0x7e, 0x43, 0x00, 0x555, 0x2aa, 1);
 
     /* create irq lines */
     cpu_irq = qemu_allocate_irqs(cpu_irq_handler, env, 1);

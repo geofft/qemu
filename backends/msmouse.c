@@ -67,7 +67,7 @@ CharDriverState *qemu_chr_open_msmouse(void)
 {
     CharDriverState *chr;
 
-    chr = g_malloc0(sizeof(CharDriverState));
+    chr = qemu_chr_alloc();
     chr->chr_write = msmouse_chr_write;
     chr->chr_close = msmouse_chr_close;
     chr->explicit_be_open = true;
@@ -79,7 +79,7 @@ CharDriverState *qemu_chr_open_msmouse(void)
 
 static void register_types(void)
 {
-    register_char_driver_qapi("msmouse", CHARDEV_BACKEND_KIND_MSMOUSE, NULL);
+    register_char_driver("msmouse", CHARDEV_BACKEND_KIND_MSMOUSE, NULL);
 }
 
 type_init(register_types);

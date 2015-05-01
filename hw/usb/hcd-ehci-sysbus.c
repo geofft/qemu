@@ -21,7 +21,7 @@ static const VMStateDescription vmstate_ehci_sysbus = {
     .name        = "ehci-sysbus",
     .version_id  = 2,
     .minimum_version_id  = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_STRUCT(ehci, EHCISysBusState, 2, vmstate_ehci, EHCIState),
         VMSTATE_END_OF_LIST()
     }
@@ -40,6 +40,15 @@ static void usb_ehci_sysbus_realize(DeviceState *dev, Error **errp)
 
     usb_ehci_realize(s, dev, errp);
     sysbus_init_irq(d, &s->irq);
+}
+
+static void usb_ehci_sysbus_reset(DeviceState *dev)
+{
+    SysBusDevice *d = SYS_BUS_DEVICE(dev);
+    EHCISysBusState *i = SYS_BUS_EHCI(d);
+    EHCIState *s = &i->ehci;
+
+    ehci_reset(s);
 }
 
 static void ehci_sysbus_init(Object *obj)
@@ -70,6 +79,7 @@ static void ehci_sysbus_class_init(ObjectClass *klass, void *data)
     dc->realize = usb_ehci_sysbus_realize;
     dc->vmsd = &vmstate_ehci_sysbus;
     dc->props = ehci_sysbus_properties;
+    dc->reset = usb_ehci_sysbus_reset;
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
 }
 

@@ -32,8 +32,6 @@
 
 #define MAX_QREGS 32
 
-#define TARGET_HAS_ICE 1
-
 #define ELF_MACHINE	EM_68K
 
 #define EXCP_ACCESS         2   /* Access (MMU) error.  */
@@ -110,6 +108,7 @@ typedef struct CPUM68KState {
 
     CPU_COMMON
 
+    /* Fields from here on are preserved across CPU reset. */
     uint32_t features;
 } CPUM68KState;
 
@@ -119,7 +118,6 @@ void m68k_tcg_init(void);
 void m68k_cpu_init_gdb(M68kCPU *cpu);
 M68kCPU *cpu_m68k_init(const char *cpu_model);
 int cpu_m68k_exec(CPUM68KState *s);
-void do_interrupt_m68k_hardirq(CPUM68KState *env1);
 /* you can call this signal handler from your SIGBUS and SIGSEGV
    signal handlers to inform the virtual CPU of exceptions. non zero
    is returned if the signal was handled by the virtual CPU.  */
@@ -214,14 +212,7 @@ void register_m68k_insns (CPUM68KState *env);
 #define TARGET_PHYS_ADDR_SPACE_BITS 32
 #define TARGET_VIRT_ADDR_SPACE_BITS 32
 
-static inline CPUM68KState *cpu_init(const char *cpu_model)
-{
-    M68kCPU *cpu = cpu_m68k_init(cpu_model);
-    if (cpu == NULL) {
-        return NULL;
-    }
-    return &cpu->env;
-}
+#define cpu_init(cpu_model) CPU(cpu_m68k_init(cpu_model))
 
 #define cpu_exec cpu_m68k_exec
 #define cpu_gen_code cpu_m68k_gen_code
@@ -237,9 +228,8 @@ static inline int cpu_mmu_index (CPUM68KState *env)
     return (env->sr & SR_S) == 0 ? 1 : 0;
 }
 
-int cpu_m68k_handle_mmu_fault(CPUM68KState *env, target_ulong address, int rw,
+int m68k_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int rw,
                               int mmu_idx);
-#define cpu_handle_mmu_fault cpu_m68k_handle_mmu_fault
 
 #include "exec/cpu-all.h"
 
@@ -251,11 +241,6 @@ static inline void cpu_get_tb_cpu_state(CPUM68KState *env, target_ulong *pc,
     *flags = (env->fpcr & M68K_FPCR_PREC)       /* Bit  6 */
             | (env->sr & SR_S)                  /* Bit  13 */
             | ((env->macsr >> 4) & 0xf);        /* Bits 0-3 */
-}
-
-static inline bool cpu_has_work(CPUState *cpu)
-{
-    return cpu->interrupt_request & CPU_INTERRUPT_HARD;
 }
 
 #include "exec/exec-all.h"

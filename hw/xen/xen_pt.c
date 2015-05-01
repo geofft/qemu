@@ -388,7 +388,7 @@ static const MemoryRegionOps ops = {
     .write = xen_pt_bar_write,
 };
 
-static int xen_pt_register_regions(XenPCIPassthroughState *s)
+static int xen_pt_register_regions(XenPCIPassthroughState *s, uint16_t *cmd)
 {
     int i = 0;
     XenHostPCIDevice *d = &s->real_device;
@@ -406,6 +406,7 @@ static int xen_pt_register_regions(XenPCIPassthroughState *s)
 
         if (r->type & XEN_HOST_PCI_REGION_TYPE_IO) {
             type = PCI_BASE_ADDRESS_SPACE_IO;
+            *cmd |= PCI_COMMAND_IO;
         } else {
             type = PCI_BASE_ADDRESS_SPACE_MEMORY;
             if (r->type & XEN_HOST_PCI_REGION_TYPE_PREFETCH) {
@@ -414,14 +415,15 @@ static int xen_pt_register_regions(XenPCIPassthroughState *s)
             if (r->type & XEN_HOST_PCI_REGION_TYPE_MEM_64) {
                 type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
             }
+            *cmd |= PCI_COMMAND_MEMORY;
         }
 
         memory_region_init_io(&s->bar[i], OBJECT(s), &ops, &s->dev,
                               "xen-pci-pt-bar", r->size);
         pci_register_bar(&s->dev, i, type, &s->bar[i]);
 
-        XEN_PT_LOG(&s->dev, "IO region %i registered (size=0x%lx"PRIx64
-                   " base_addr=0x%lx"PRIx64" type: %#x)\n",
+        XEN_PT_LOG(&s->dev, "IO region %i registered (size=0x%08"PRIx64
+                   " base_addr=0x%08"PRIx64" type: %#x)\n",
                    i, r->size, r->base_addr, type);
     }
 
@@ -440,8 +442,8 @@ static int xen_pt_register_regions(XenPCIPassthroughState *s)
 
         s->bases[PCI_ROM_SLOT].access.maddr = d->rom.base_addr;
 
-        memory_region_init_rom_device(&s->rom, OBJECT(s), NULL, NULL,
-                                      "xen-pci-pt-rom", d->rom.size);
+        memory_region_init_io(&s->rom, OBJECT(s), &ops, &s->dev,
+                              "xen-pci-pt-rom", d->rom.size);
         pci_register_bar(&s->dev, PCI_ROM_SLOT, PCI_BASE_ADDRESS_MEM_PREFETCH,
                          &s->rom);
 
@@ -451,25 +453,6 @@ static int xen_pt_register_regions(XenPCIPassthroughState *s)
     }
 
     return 0;
-}
-
-static void xen_pt_unregister_regions(XenPCIPassthroughState *s)
-{
-    XenHostPCIDevice *d = &s->real_device;
-    int i;
-
-    for (i = 0; i < PCI_NUM_REGIONS - 1; i++) {
-        XenHostPCIIORegion *r = &d->io_regions[i];
-
-        if (r->base_addr == 0 || r->size == 0) {
-            continue;
-        }
-
-        memory_region_destroy(&s->bar[i]);
-    }
-    if (d->rom.base_addr && d->rom.size) {
-        memory_region_destroy(&s->rom);
-    }
 }
 
 /* region mapping */
@@ -657,6 +640,7 @@ static int xen_pt_initfn(PCIDevice *d)
     XenPCIPassthroughState *s = DO_UPCAST(XenPCIPassthroughState, dev, d);
     int rc = 0;
     uint8_t machine_irq = 0;
+    uint16_t cmd = 0;
     int pirq = XEN_PT_UNASSIGNED_PIRQ;
 
     /* register real device */
@@ -691,7 +675,7 @@ static int xen_pt_initfn(PCIDevice *d)
     s->io_listener = xen_pt_io_listener;
 
     /* Handle real device's MMIO/PIO BARs */
-    xen_pt_register_regions(s);
+    xen_pt_register_regions(s, &cmd);
 
     /* reinitialize each config register to be emulated */
     if (xen_pt_config_init(s)) {
@@ -755,7 +739,12 @@ static int xen_pt_initfn(PCIDevice *d)
     }
 
 out:
-    memory_listener_register(&s->memory_listener, &address_space_memory);
+    if (cmd) {
+        xen_host_pci_set_word(&s->real_device, PCI_COMMAND,
+                              pci_get_word(d->config + PCI_COMMAND) | cmd);
+    }
+
+    memory_listener_register(&s->memory_listener, &s->dev.bus_master_as);
     memory_listener_register(&s->io_listener, &address_space_io);
     XEN_PT_LOG(d,
                "Real physical device %02x:%02x.%d registered successfully!\n",
@@ -810,7 +799,6 @@ static void xen_pt_unregister_device(PCIDevice *d)
     /* delete all emulated config registers */
     xen_pt_config_delete(s);
 
-    xen_pt_unregister_regions(s);
     memory_listener_unregister(&s->memory_listener);
     memory_listener_unregister(&s->io_listener);
 

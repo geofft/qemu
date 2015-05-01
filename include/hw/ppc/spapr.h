@@ -13,10 +13,9 @@ struct sPAPRNVRAM;
 typedef struct sPAPREnvironment {
     struct VIOsPAPRBus *vio_bus;
     QLIST_HEAD(, sPAPRPHBState) phbs;
-    hwaddr msi_win_addr;
-    MemoryRegion msiwindow;
     struct sPAPRNVRAM *nvram;
     XICSState *icp;
+    DeviceState *rtc;
 
     hwaddr ram_limit;
     void *htab;
@@ -24,11 +23,12 @@ typedef struct sPAPREnvironment {
     hwaddr rma_size;
     int vrma_adjust;
     hwaddr fdt_addr, rtas_addr;
-    long rtas_size;
+    ssize_t rtas_size;
+    void *rtas_blob;
     void *fdt_skel;
     target_ulong entry_point;
-    uint32_t next_irq;
-    uint64_t rtc_offset;
+    uint64_t rtc_offset; /* Now used only during incoming migration */
+    struct PPCTimebase tb;
     bool has_graphics;
 
     uint32_t epow_irq;
@@ -38,6 +38,7 @@ typedef struct sPAPREnvironment {
     int htab_save_index;
     bool htab_first_pass;
     int htab_fd;
+    bool htab_fd_stale;
 } sPAPREnvironment;
 
 #define H_SUCCESS         0
@@ -153,10 +154,20 @@ typedef struct sPAPREnvironment {
 #define H_PP1             (1ULL<<(63-62))
 #define H_PP2             (1ULL<<(63-63))
 
-/* H_SET_MODE flags */
-#define H_SET_MODE_ENDIAN        4
+/* Values for 2nd argument to H_SET_MODE */
+#define H_SET_MODE_RESOURCE_SET_CIABR           1
+#define H_SET_MODE_RESOURCE_SET_DAWR            2
+#define H_SET_MODE_RESOURCE_ADDR_TRANS_MODE     3
+#define H_SET_MODE_RESOURCE_LE                  4
+
+/* Flags for H_SET_MODE_RESOURCE_LE */
 #define H_SET_MODE_ENDIAN_BIG    0
 #define H_SET_MODE_ENDIAN_LITTLE 1
+
+/* Flags for H_SET_MODE_RESOURCE_ADDR_TRANS_MODE */
+#define H_SET_MODE_ADDR_TRANS_NONE                  0
+#define H_SET_MODE_ADDR_TRANS_0001_8000             2
+#define H_SET_MODE_ADDR_TRANS_C000_0000_0000_4000   3
 
 /* VASI States */
 #define H_VASI_INVALID    0
@@ -297,9 +308,15 @@ typedef struct sPAPREnvironment {
 #define KVMPPC_HCALL_BASE       0xf000
 #define KVMPPC_H_RTAS           (KVMPPC_HCALL_BASE + 0x0)
 #define KVMPPC_H_LOGICAL_MEMOP  (KVMPPC_HCALL_BASE + 0x1)
-#define KVMPPC_HCALL_MAX        KVMPPC_H_LOGICAL_MEMOP
+/* Client Architecture support */
+#define KVMPPC_H_CAS            (KVMPPC_HCALL_BASE + 0x2)
+#define KVMPPC_HCALL_MAX        KVMPPC_H_CAS
 
 extern sPAPREnvironment *spapr;
+
+typedef struct sPAPRDeviceTreeUpdateHeader {
+    uint32_t version_id;
+} sPAPRDeviceTreeUpdateHeader;
 
 /*#define DEBUG_SPAPR_HCALLS*/
 
@@ -322,15 +339,38 @@ target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
 int spapr_allocate_irq(int hint, bool lsi);
 int spapr_allocate_irq_block(int num, bool lsi, bool msi);
 
-static inline int spapr_allocate_msi(int hint)
-{
-    return spapr_allocate_irq(hint, false);
-}
+/* ibm,set-eeh-option */
+#define RTAS_EEH_DISABLE                 0
+#define RTAS_EEH_ENABLE                  1
+#define RTAS_EEH_THAW_IO                 2
+#define RTAS_EEH_THAW_DMA                3
 
-static inline int spapr_allocate_lsi(int hint)
-{
-    return spapr_allocate_irq(hint, true);
-}
+/* ibm,get-config-addr-info2 */
+#define RTAS_GET_PE_ADDR                 0
+#define RTAS_GET_PE_MODE                 1
+#define RTAS_PE_MODE_NONE                0
+#define RTAS_PE_MODE_NOT_SHARED          1
+#define RTAS_PE_MODE_SHARED              2
+
+/* ibm,read-slot-reset-state2 */
+#define RTAS_EEH_PE_STATE_NORMAL         0
+#define RTAS_EEH_PE_STATE_RESET          1
+#define RTAS_EEH_PE_STATE_STOPPED_IO_DMA 2
+#define RTAS_EEH_PE_STATE_STOPPED_DMA    4
+#define RTAS_EEH_PE_STATE_UNAVAIL        5
+#define RTAS_EEH_NOT_SUPPORT             0
+#define RTAS_EEH_SUPPORT                 1
+#define RTAS_EEH_PE_UNAVAIL_INFO         1000
+#define RTAS_EEH_PE_RECOVER_INFO         0
+
+/* ibm,set-slot-reset */
+#define RTAS_SLOT_RESET_DEACTIVATE       0
+#define RTAS_SLOT_RESET_HOT              1
+#define RTAS_SLOT_RESET_FUNDAMENTAL      3
+
+/* ibm,slot-error-detail */
+#define RTAS_SLOT_TEMP_ERR_LOG           1
+#define RTAS_SLOT_PERM_ERR_LOG           2
 
 /* RTAS return codes */
 #define RTAS_OUT_SUCCESS            0
@@ -341,6 +381,63 @@ static inline int spapr_allocate_lsi(int hint)
 #define RTAS_OUT_NOT_SUPPORTED      -3
 #define RTAS_OUT_NOT_AUTHORIZED     -9002
 
+/* RTAS tokens */
+#define RTAS_TOKEN_BASE      0x2000
+
+#define RTAS_DISPLAY_CHARACTER                  (RTAS_TOKEN_BASE + 0x00)
+#define RTAS_GET_TIME_OF_DAY                    (RTAS_TOKEN_BASE + 0x01)
+#define RTAS_SET_TIME_OF_DAY                    (RTAS_TOKEN_BASE + 0x02)
+#define RTAS_POWER_OFF                          (RTAS_TOKEN_BASE + 0x03)
+#define RTAS_SYSTEM_REBOOT                      (RTAS_TOKEN_BASE + 0x04)
+#define RTAS_QUERY_CPU_STOPPED_STATE            (RTAS_TOKEN_BASE + 0x05)
+#define RTAS_START_CPU                          (RTAS_TOKEN_BASE + 0x06)
+#define RTAS_STOP_SELF                          (RTAS_TOKEN_BASE + 0x07)
+#define RTAS_IBM_GET_SYSTEM_PARAMETER           (RTAS_TOKEN_BASE + 0x08)
+#define RTAS_IBM_SET_SYSTEM_PARAMETER           (RTAS_TOKEN_BASE + 0x09)
+#define RTAS_IBM_SET_XIVE                       (RTAS_TOKEN_BASE + 0x0A)
+#define RTAS_IBM_GET_XIVE                       (RTAS_TOKEN_BASE + 0x0B)
+#define RTAS_IBM_INT_OFF                        (RTAS_TOKEN_BASE + 0x0C)
+#define RTAS_IBM_INT_ON                         (RTAS_TOKEN_BASE + 0x0D)
+#define RTAS_CHECK_EXCEPTION                    (RTAS_TOKEN_BASE + 0x0E)
+#define RTAS_EVENT_SCAN                         (RTAS_TOKEN_BASE + 0x0F)
+#define RTAS_IBM_SET_TCE_BYPASS                 (RTAS_TOKEN_BASE + 0x10)
+#define RTAS_QUIESCE                            (RTAS_TOKEN_BASE + 0x11)
+#define RTAS_NVRAM_FETCH                        (RTAS_TOKEN_BASE + 0x12)
+#define RTAS_NVRAM_STORE                        (RTAS_TOKEN_BASE + 0x13)
+#define RTAS_READ_PCI_CONFIG                    (RTAS_TOKEN_BASE + 0x14)
+#define RTAS_WRITE_PCI_CONFIG                   (RTAS_TOKEN_BASE + 0x15)
+#define RTAS_IBM_READ_PCI_CONFIG                (RTAS_TOKEN_BASE + 0x16)
+#define RTAS_IBM_WRITE_PCI_CONFIG               (RTAS_TOKEN_BASE + 0x17)
+#define RTAS_IBM_QUERY_INTERRUPT_SOURCE_NUMBER  (RTAS_TOKEN_BASE + 0x18)
+#define RTAS_IBM_CHANGE_MSI                     (RTAS_TOKEN_BASE + 0x19)
+#define RTAS_SET_INDICATOR                      (RTAS_TOKEN_BASE + 0x1A)
+#define RTAS_SET_POWER_LEVEL                    (RTAS_TOKEN_BASE + 0x1B)
+#define RTAS_GET_POWER_LEVEL                    (RTAS_TOKEN_BASE + 0x1C)
+#define RTAS_GET_SENSOR_STATE                   (RTAS_TOKEN_BASE + 0x1D)
+#define RTAS_IBM_CONFIGURE_CONNECTOR            (RTAS_TOKEN_BASE + 0x1E)
+#define RTAS_IBM_OS_TERM                        (RTAS_TOKEN_BASE + 0x1F)
+#define RTAS_IBM_SET_EEH_OPTION                 (RTAS_TOKEN_BASE + 0x20)
+#define RTAS_IBM_GET_CONFIG_ADDR_INFO2          (RTAS_TOKEN_BASE + 0x21)
+#define RTAS_IBM_READ_SLOT_RESET_STATE2         (RTAS_TOKEN_BASE + 0x22)
+#define RTAS_IBM_SET_SLOT_RESET                 (RTAS_TOKEN_BASE + 0x23)
+#define RTAS_IBM_CONFIGURE_PE                   (RTAS_TOKEN_BASE + 0x24)
+#define RTAS_IBM_SLOT_ERROR_DETAIL              (RTAS_TOKEN_BASE + 0x25)
+
+#define RTAS_TOKEN_MAX                          (RTAS_TOKEN_BASE + 0x26)
+
+/* RTAS ibm,get-system-parameter token values */
+#define RTAS_SYSPARM_SPLPAR_CHARACTERISTICS      20
+#define RTAS_SYSPARM_DIAGNOSTICS_RUN_MODE        42
+#define RTAS_SYSPARM_UUID                        48
+
+/* Possible values for the platform-processor-diagnostics-run-mode parameter
+ * of the RTAS ibm,get-system-parameter call.
+ */
+#define DIAGNOSTICS_RUN_MODE_DISABLED  0
+#define DIAGNOSTICS_RUN_MODE_STAGGERED 1
+#define DIAGNOSTICS_RUN_MODE_IMMEDIATE 2
+#define DIAGNOSTICS_RUN_MODE_PERIODIC  3
+
 static inline uint64_t ppc64_phys_to_real(uint64_t addr)
 {
     return addr & ~0xF000000000000000ULL;
@@ -348,19 +445,32 @@ static inline uint64_t ppc64_phys_to_real(uint64_t addr)
 
 static inline uint32_t rtas_ld(target_ulong phys, int n)
 {
-    return ldl_be_phys(ppc64_phys_to_real(phys + 4*n));
+    return ldl_be_phys(&address_space_memory, ppc64_phys_to_real(phys + 4*n));
 }
 
 static inline void rtas_st(target_ulong phys, int n, uint32_t val)
 {
-    stl_be_phys(ppc64_phys_to_real(phys + 4*n), val);
+    stl_be_phys(&address_space_memory, ppc64_phys_to_real(phys + 4*n), val);
+}
+
+
+static inline void rtas_st_buffer(target_ulong phys, target_ulong phys_len,
+                                  uint8_t *buffer, uint16_t buffer_len)
+{
+    if (phys_len < 2) {
+        return;
+    }
+    stw_be_phys(&address_space_memory,
+                ppc64_phys_to_real(phys), buffer_len);
+    cpu_physical_memory_write(ppc64_phys_to_real(phys + 2),
+                              buffer, MIN(buffer_len, phys_len - 2));
 }
 
 typedef void (*spapr_rtas_fn)(PowerPCCPU *cpu, sPAPREnvironment *spapr,
                               uint32_t token,
                               uint32_t nargs, target_ulong args,
                               uint32_t nret, target_ulong rets);
-int spapr_rtas_register(const char *name, spapr_rtas_fn fn);
+void spapr_rtas_register(int token, const char *name, spapr_rtas_fn fn);
 target_ulong spapr_rtas_call(PowerPCCPU *cpu, sPAPREnvironment *spapr,
                              uint32_t token, uint32_t nargs, target_ulong args,
                              uint32_t nret, target_ulong rets);
@@ -385,24 +495,36 @@ typedef struct sPAPRTCETable sPAPRTCETable;
 struct sPAPRTCETable {
     DeviceState parent;
     uint32_t liobn;
-    uint32_t window_size;
     uint32_t nb_table;
+    uint64_t bus_offset;
+    uint32_t page_shift;
     uint64_t *table;
     bool bypass;
+    bool vfio_accel;
     int fd;
     MemoryRegion iommu;
+    struct VIOsPAPRDevice *vdev; /* for @bypass migration compatibility only */
     QLIST_ENTRY(sPAPRTCETable) list;
 };
 
 void spapr_events_init(sPAPREnvironment *spapr);
 void spapr_events_fdt_skel(void *fdt, uint32_t epow_irq);
+int spapr_h_cas_compose_response(target_ulong addr, target_ulong size);
 sPAPRTCETable *spapr_tce_new_table(DeviceState *owner, uint32_t liobn,
-                                   size_t window_size);
+                                   uint64_t bus_offset,
+                                   uint32_t page_shift,
+                                   uint32_t nb_table,
+                                   bool vfio_accel);
 MemoryRegion *spapr_tce_get_iommu(sPAPRTCETable *tcet);
-void spapr_tce_set_bypass(sPAPRTCETable *tcet, bool bypass);
 int spapr_dma_dt(void *fdt, int node_off, const char *propname,
                  uint32_t liobn, uint64_t window, uint32_t size);
 int spapr_tcet_dma_dt(void *fdt, int node_off, const char *propname,
                       sPAPRTCETable *tcet);
+void spapr_pci_switch_vga(bool big_endian);
+
+#define TYPE_SPAPR_RTC "spapr-rtc"
+
+void spapr_rtc_read(DeviceState *dev, struct tm *tm, uint32_t *ns);
+int spapr_rtc_import_offset(DeviceState *dev, int64_t legacy_offset);
 
 #endif /* !defined (__HW_SPAPR_H__) */

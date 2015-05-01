@@ -65,7 +65,7 @@ enum {
     DSKCHG  = 0x80,
 };
 
-char test_image[] = "/tmp/qtest.XXXXXX";
+static char test_image[] = "/tmp/qtest.XXXXXX";
 
 #define assert_bit_set(data, mask) g_assert_cmphex((data) & (mask), ==, (mask))
 #define assert_bit_clear(data, mask) g_assert_cmphex((data) & (mask), ==, 0)
@@ -291,7 +291,7 @@ static void test_media_insert(void)
     /* Insert media in drive. DSKCHK should not be reset until a step pulse
      * is sent. */
     qmp_discard_response("{'execute':'change', 'arguments':{"
-                         " 'device':'floppy0', 'target': '%s' }}",
+                         " 'device':'floppy0', 'target': %s, 'arg': 'raw' }}",
                          test_image);
     qmp_discard_response(""); /* ignore event
                                  (FIXME open -> open transition?!) */
@@ -518,7 +518,6 @@ static void fuzz_registers(void)
 int main(int argc, char **argv)
 {
     const char *arch = qtest_get_arch();
-    char *cmdline;
     int fd;
     int ret;
 
@@ -538,9 +537,7 @@ int main(int argc, char **argv)
     /* Run the tests */
     g_test_init(&argc, &argv, NULL);
 
-    cmdline = g_strdup_printf("-vnc none ");
-
-    qtest_start(cmdline);
+    qtest_start(NULL);
     qtest_irq_intercept_in(global_qtest, "ioapic");
     qtest_add_func("/fdc/cmos", test_cmos);
     qtest_add_func("/fdc/no_media_on_start", test_no_media_on_start);

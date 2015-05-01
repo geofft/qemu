@@ -350,7 +350,7 @@
 #define TARGET_NR_vmsplice			(343)
 #define TARGET_NR_move_pages			(344)
 #define TARGET_NR_getcpu			(345)
-					/* 346 for epoll_pwait */
+#define TARGET_NR_epoll_pwait                   (346)
 #define TARGET_NR_kexec_load			(347)
 #define TARGET_NR_utimensat			(348)
 #define TARGET_NR_signalfd			(349)
@@ -378,3 +378,9 @@
 #define TARGET_NR_open_by_handle_at            (371)
 #define TARGET_NR_clock_adjtime                (372)
 #define TARGET_NR_syncfs                       (373)
+#define TARGET_NR_sendmmsg                     (374)
+#define TARGET_NR_setns                        (375)
+#define TARGET_NR_process_vm_readv             (376)
+#define TARGET_NR_process_vm_writev            (377)
+#define TARGET_NR_kcmp                         (378)
+#define TARGET_NR_finit_module                 (379)

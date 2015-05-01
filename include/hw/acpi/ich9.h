@@ -22,6 +22,9 @@
 #define HW_ACPI_ICH9_H
 
 #include "hw/acpi/acpi.h"
+#include "hw/acpi/cpu_hotplug.h"
+#include "hw/acpi/memory_hotplug.h"
+#include "hw/acpi/acpi_dev_interface.h"
 
 typedef struct ICH9LPCPMRegs {
     /*
@@ -42,6 +45,14 @@ typedef struct ICH9LPCPMRegs {
 
     uint32_t pm_io_base;
     Notifier powerdown_notifier;
+
+    AcpiCpuHotplug gpe_cpu;
+
+    MemHotplugState acpi_memory_hotplug;
+
+    uint8_t disable_s3;
+    uint8_t disable_s4;
+    uint8_t s4_val;
 } ICH9LPCPMRegs;
 
 void ich9_pm_init(PCIDevice *lpc_pci, ICH9LPCPMRegs *pm,
@@ -51,4 +62,11 @@ extern const VMStateDescription vmstate_ich9_pm;
 
 void ich9_pm_add_properties(Object *obj, ICH9LPCPMRegs *pm, Error **errp);
 
+void ich9_pm_device_plug_cb(ICH9LPCPMRegs *pm, DeviceState *dev, Error **errp);
+void ich9_pm_device_unplug_request_cb(ICH9LPCPMRegs *pm, DeviceState *dev,
+                                      Error **errp);
+void ich9_pm_device_unplug_cb(ICH9LPCPMRegs *pm, DeviceState *dev,
+                              Error **errp);
+
+void ich9_pm_ospm_status(AcpiDeviceIf *adev, ACPIOSTInfoList ***list);
 #endif /* HW_ACPI_ICH9_H */

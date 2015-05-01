@@ -31,49 +31,17 @@ DefinitionBlock (
 
 #include "acpi-dsdt-dbug.dsl"
 
-
-/****************************************************************
- * PCI Bus definition
- ****************************************************************/
-
     Scope(\_SB) {
         Device(PCI0) {
             Name(_HID, EisaId("PNP0A03"))
             Name(_ADR, 0x00)
             Name(_UID, 1)
+//#define PX13 S0B_
+//            External(PX13, DeviceObj)
         }
     }
 
-#include "acpi-dsdt-pci-crs.dsl"
 #include "acpi-dsdt-hpet.dsl"
-
-
-/****************************************************************
- * VGA
- ****************************************************************/
-
-    Scope(\_SB.PCI0) {
-        Device(VGA) {
-            Name(_ADR, 0x00020000)
-            OperationRegion(PCIC, PCI_Config, Zero, 0x4)
-            Field(PCIC, DWordAcc, NoLock, Preserve) {
-                VEND, 32
-            }
-            Method(_S1D, 0, NotSerialized) {
-                Return (0x00)
-            }
-            Method(_S2D, 0, NotSerialized) {
-                Return (0x00)
-            }
-            Method(_S3D, 0, NotSerialized) {
-                If (LEqual(VEND, 0x1001b36)) {
-                    Return (0x03)           // QXL
-                } Else {
-                    Return (0x00)
-                }
-            }
-        }
-    }
 
 
 /****************************************************************
@@ -93,6 +61,9 @@ DefinitionBlock (
  ****************************************************************/
 
     Scope(\_SB.PCI0) {
+
+        External(ISA, DeviceObj)
+
         Device(ISA) {
             Name(_ADR, 0x00010000)
 
@@ -133,32 +104,28 @@ DefinitionBlock (
             B0EJ, 32,
         }
 
+        OperationRegion(BNMR, SystemIO, 0xae10, 0x04)
+        Field(BNMR, DWordAcc, NoLock, WriteAsZeros) {
+            BNUM, 32,
+        }
+
+        /* Lock to protect access to fields above. */
+        Mutex(BLCK, 0)
+
         /* Methods called by bulk generated PCI devices below */
 
         /* Methods called by hotplug devices */
-        Method(PCEJ, 1, NotSerialized) {
+        Method(PCEJ, 2, NotSerialized) {
             // _EJ0 method - eject callback
-            Store(ShiftLeft(1, Arg0), B0EJ)
+            Acquire(BLCK, 0xFFFF)
+            Store(Arg0, BNUM)
+            Store(ShiftLeft(1, Arg1), B0EJ)
+            Release(BLCK)
             Return (0x0)
         }
 
         /* Hotplug notification method supplied by SSDT */
         External(\_SB.PCI0.PCNT, MethodObj)
-
-        /* PCI hotplug notify method */
-        Method(PCNF, 0) {
-            // Local0 = iterator
-            Store(Zero, Local0)
-            While (LLess(Local0, 31)) {
-                Increment(Local0)
-                If (And(PCIU, ShiftLeft(1, Local0))) {
-                    PCNT(Local0, 1)
-                }
-                If (And(PCID, ShiftLeft(1, Local0))) {
-                    PCNT(Local0, 3)
-                }
-            }
-        }
     }
 
 
@@ -168,57 +135,45 @@ DefinitionBlock (
 
     Scope(\_SB) {
         Scope(PCI0) {
-            Name(_PRT, Package() {
-                /* PCI IRQ routing table, example from ACPI 2.0a specification,
-                   section 6.2.8.1 */
-                /* Note: we provide the same info as the PCI routing
-                   table of the Bochs BIOS */
+            Method (_PRT, 0) {
+                Store(Package(128) {}, Local0)
+                Store(Zero, Local1)
+                While(LLess(Local1, 128)) {
+                    // slot = pin >> 2
+                    Store(ShiftRight(Local1, 2), Local2)
 
-#define prt_slot(nr, lnk0, lnk1, lnk2, lnk3) \
-    Package() { nr##ffff, 0, lnk0, 0 }, \
-    Package() { nr##ffff, 1, lnk1, 0 }, \
-    Package() { nr##ffff, 2, lnk2, 0 }, \
-    Package() { nr##ffff, 3, lnk3, 0 }
+                    // lnk = (slot + pin) & 3
+                    Store(And(Add(Local1, Local2), 3), Local3)
+                    If (LEqual(Local3, 0)) {
+                        Store(Package(4) { Zero, Zero, LNKD, Zero }, Local4)
+                    }
+                    If (LEqual(Local3, 1)) {
+                        // device 1 is the power-management device, needs SCI
+                        If (LEqual(Local1, 4)) {
+                            Store(Package(4) { Zero, Zero, LNKS, Zero }, Local4)
+                        } Else {
+                            Store(Package(4) { Zero, Zero, LNKA, Zero }, Local4)
+                        }
+                    }
+                    If (LEqual(Local3, 2)) {
+                        Store(Package(4) { Zero, Zero, LNKB, Zero }, Local4)
+                    }
+                    If (LEqual(Local3, 3)) {
+                        Store(Package(4) { Zero, Zero, LNKC, Zero }, Local4)
+                    }
 
-#define prt_slot0(nr) prt_slot(nr, LNKD, LNKA, LNKB, LNKC)
-#define prt_slot1(nr) prt_slot(nr, LNKA, LNKB, LNKC, LNKD)
-#define prt_slot2(nr) prt_slot(nr, LNKB, LNKC, LNKD, LNKA)
-#define prt_slot3(nr) prt_slot(nr, LNKC, LNKD, LNKA, LNKB)
+                    // Complete the interrupt routing entry:
+                    //    Package(4) { 0x[slot]FFFF, [pin], [link], 0) }
 
-                prt_slot0(0x0000),
-                /* Device 1 is power mgmt device, and can only use irq 9 */
-                prt_slot(0x0001, LNKS, LNKB, LNKC, LNKD),
-                prt_slot2(0x0002),
-                prt_slot3(0x0003),
-                prt_slot0(0x0004),
-                prt_slot1(0x0005),
-                prt_slot2(0x0006),
-                prt_slot3(0x0007),
-                prt_slot0(0x0008),
-                prt_slot1(0x0009),
-                prt_slot2(0x000a),
-                prt_slot3(0x000b),
-                prt_slot0(0x000c),
-                prt_slot1(0x000d),
-                prt_slot2(0x000e),
-                prt_slot3(0x000f),
-                prt_slot0(0x0010),
-                prt_slot1(0x0011),
-                prt_slot2(0x0012),
-                prt_slot3(0x0013),
-                prt_slot0(0x0014),
-                prt_slot1(0x0015),
-                prt_slot2(0x0016),
-                prt_slot3(0x0017),
-                prt_slot0(0x0018),
-                prt_slot1(0x0019),
-                prt_slot2(0x001a),
-                prt_slot3(0x001b),
-                prt_slot0(0x001c),
-                prt_slot1(0x001d),
-                prt_slot2(0x001e),
-                prt_slot3(0x001f),
-            })
+                    Store(Or(ShiftLeft(Local2, 16), 0xFFFF), Index(Local4, 0))
+                    Store(And(Local1, 3),                    Index(Local4, 1))
+                    Store(Local4,                            Index(Local0, Local1))
+
+                    Increment(Local1)
+                }
+
+                Return(Local0)
+            }
         }
 
         Field(PCI0.ISA.P40C, ByteAcc, NoLock, Preserve) {
@@ -293,13 +248,15 @@ DefinitionBlock (
         }
     }
 
+#include "hw/acpi/pc-hotplug.h"
+#define CPU_STATUS_BASE PIIX4_CPU_HOTPLUG_IO_BASE
 #include "acpi-dsdt-cpu-hotplug.dsl"
+#include "acpi-dsdt-mem-hotplug.dsl"
 
 
 /****************************************************************
  * General purpose events
  ****************************************************************/
-
     Scope(\_GPE) {
         Name(_HID, "ACPI0006")
 
@@ -307,13 +264,17 @@ DefinitionBlock (
         }
         Method(_E01) {
             // PCI hotplug event
-            \_SB.PCI0.PCNF()
+            Acquire(\_SB.PCI0.BLCK, 0xFFFF)
+            \_SB.PCI0.PCNT()
+            Release(\_SB.PCI0.BLCK)
         }
         Method(_E02) {
             // CPU hotplug event
             \_SB.PRSC()
         }
-        Method(_L03) {
+        Method(_E03) {
+            // Memory hotplug event
+            \_SB.PCI0.MEMORY_HOTPLUG_DEVICE.MEMORY_SLOT_SCAN_METHOD()
         }
         Method(_L04) {
         }

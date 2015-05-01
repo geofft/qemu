@@ -1217,7 +1217,6 @@ static void eepro100_write_mdi(EEPRO100State *s)
                 break;
             case 1:            /* Status Register */
                 missing("not writable");
-                data = s->mdimem[reg];
                 break;
             case 2:            /* PHY Identification Register (Word 1) */
             case 3:            /* PHY Identification Register (Word 2) */
@@ -1230,7 +1229,8 @@ static void eepro100_write_mdi(EEPRO100State *s)
             default:
                 missing("not implemented");
             }
-            s->mdimem[reg] = data;
+            s->mdimem[reg] &= eepro100_mdi_mask[reg];
+            s->mdimem[reg] |= data & ~eepro100_mdi_mask[reg];
         } else if (opcode == 2) {
             /* MDI read */
             switch (reg) {
@@ -1784,8 +1784,7 @@ static ssize_t nic_receive(NetClientState *nc, const uint8_t * buf, size_t size)
 static const VMStateDescription vmstate_eepro100 = {
     .version_id = 3,
     .minimum_version_id = 2,
-    .minimum_version_id_old = 2,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, EEPRO100State),
         VMSTATE_UNUSED(32),
         VMSTATE_BUFFER(mult, EEPRO100State),
@@ -1833,20 +1832,10 @@ static const VMStateDescription vmstate_eepro100 = {
     }
 };
 
-static void nic_cleanup(NetClientState *nc)
-{
-    EEPRO100State *s = qemu_get_nic_opaque(nc);
-
-    s->nic = NULL;
-}
-
 static void pci_nic_uninit(PCIDevice *pci_dev)
 {
     EEPRO100State *s = DO_UPCAST(EEPRO100State, dev, pci_dev);
 
-    memory_region_destroy(&s->mmio_bar);
-    memory_region_destroy(&s->io_bar);
-    memory_region_destroy(&s->flash_bar);
     vmstate_unregister(&pci_dev->qdev, s->vmstate, s);
     eeprom93xx_free(&pci_dev->qdev, s->eeprom);
     qemu_del_nic(s->nic);
@@ -1857,10 +1846,9 @@ static NetClientInfo net_eepro100_info = {
     .size = sizeof(NICState),
     .can_receive = nic_can_receive,
     .receive = nic_receive,
-    .cleanup = nic_cleanup,
 };
 
-static int e100_nic_init(PCIDevice *pci_dev)
+static void e100_nic_realize(PCIDevice *pci_dev, Error **errp)
 {
     EEPRO100State *s = DO_UPCAST(EEPRO100State, dev, pci_dev);
     E100PCIDeviceInfo *info = eepro100_get_class(s);
@@ -1904,10 +1892,14 @@ static int e100_nic_init(PCIDevice *pci_dev)
     memcpy(s->vmstate, &vmstate_eepro100, sizeof(vmstate_eepro100));
     s->vmstate->name = qemu_get_queue(s->nic)->model;
     vmstate_register(&pci_dev->qdev, -1, s->vmstate, s);
+}
 
-    add_boot_device_path(s->conf.bootindex, &pci_dev->qdev, "/ethernet-phy@0");
-
-    return 0;
+static void eepro100_instance_init(Object *obj)
+{
+    EEPRO100State *s = DO_UPCAST(EEPRO100State, dev, PCI_DEVICE(obj));
+    device_add_bootindex_property(obj, &s->conf.bootindex,
+                                  "bootindex", "/ethernet-phy@0",
+                                  DEVICE(s), NULL);
 }
 
 static E100PCIDeviceInfo e100_devices[] = {
@@ -2089,7 +2081,7 @@ static void eepro100_class_init(ObjectClass *klass, void *data)
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->class_id = PCI_CLASS_NETWORK_ETHERNET;
     k->romfile = "pxe-eepro100.rom";
-    k->init = e100_nic_init;
+    k->realize = e100_nic_realize;
     k->exit = pci_nic_uninit;
     k->device_id = info->device_id;
     k->revision = info->revision;
@@ -2108,7 +2100,8 @@ static void eepro100_register_types(void)
         type_info.parent = TYPE_PCI_DEVICE;
         type_info.class_init = eepro100_class_init;
         type_info.instance_size = sizeof(EEPRO100State);
-        
+        type_info.instance_init = eepro100_instance_init;
+
         type_register(&type_info);
     }
 }

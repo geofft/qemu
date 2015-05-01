@@ -57,6 +57,8 @@
 #define PCI_EXP_SLTCTL_PIC_SHIFT        (ffs(PCI_EXP_SLTCTL_PIC) - 1)
 #define PCI_EXP_SLTCTL_PIC_OFF                          \
     (PCI_EXP_SLTCTL_IND_OFF << PCI_EXP_SLTCTL_PIC_SHIFT)
+#define PCI_EXP_SLTCTL_PIC_ON                          \
+    (PCI_EXP_SLTCTL_IND_ON << PCI_EXP_SLTCTL_PIC_SHIFT)
 
 #define PCI_EXP_SLTCTL_SUPPORTED        \
             (PCI_EXP_SLTCTL_ABPE |      \
@@ -70,7 +72,7 @@
 #define PCI_EXP_DEVCAP2_EFF             0x100000
 #define PCI_EXP_DEVCAP2_EETLPP          0x200000
 
-#define PCI_EXP_DEVCTL2_EETLPPB         0x80
+#define PCI_EXP_DEVCTL2_EETLPPB         0x8000
 
 /* ARI */
 #define PCI_ARI_VER                     1

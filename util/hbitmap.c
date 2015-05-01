@@ -92,11 +92,6 @@ struct HBitmap {
     unsigned long *levels[HBITMAP_LEVELS];
 };
 
-static inline int popcountl(unsigned long l)
-{
-    return BITS_PER_LONG == 32 ? ctpop32(l) : ctpop64(l);
-}
-
 /* Advance hbi to the next nonzero word and return it.  hbi->pos
  * is updated.  Returns zero if we reach the end of the bitmap.
  */
@@ -200,14 +195,14 @@ static uint64_t hb_count_between(HBitmap *hb, uint64_t start, uint64_t last)
         if (pos >= (end >> BITS_PER_LEVEL)) {
             break;
         }
-        count += popcountl(cur);
+        count += ctpopl(cur);
     }
 
     if (pos == (end >> BITS_PER_LEVEL)) {
         /* Drop bits representing the END-th and subsequent items.  */
         int bit = end & (BITS_PER_LONG - 1);
         cur &= (1UL << bit) - 1;
-        count += popcountl(cur);
+        count += ctpopl(cur);
     }
 
     return count;
@@ -378,7 +373,7 @@ void hbitmap_free(HBitmap *hb)
 
 HBitmap *hbitmap_alloc(uint64_t size, int granularity)
 {
-    HBitmap *hb = g_malloc0(sizeof (struct HBitmap));
+    HBitmap *hb = g_new0(struct HBitmap, 1);
     unsigned i;
 
     assert(granularity >= 0 && granularity < 64);
@@ -389,7 +384,7 @@ HBitmap *hbitmap_alloc(uint64_t size, int granularity)
     hb->granularity = granularity;
     for (i = HBITMAP_LEVELS; i-- > 0; ) {
         size = MAX((size + BITS_PER_LONG - 1) >> BITS_PER_LEVEL, 1);
-        hb->levels[i] = g_malloc0(size * sizeof(unsigned long));
+        hb->levels[i] = g_new0(unsigned long, size);
     }
 
     /* We necessarily have free bits in level 0 due to the definition

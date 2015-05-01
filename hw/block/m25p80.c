@@ -22,6 +22,7 @@
  */
 
 #include "hw/hw.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "hw/ssi.h"
 
@@ -241,10 +242,11 @@ typedef enum {
 } CMDState;
 
 typedef struct Flash {
-    SSISlave ssidev;
+    SSISlave parent_obj;
+
     uint32_t r;
 
-    BlockDriverState *bdrv;
+    BlockBackend *blk;
 
     uint8_t *storage;
     uint32_t size;
@@ -278,7 +280,7 @@ typedef struct M25P80Class {
 #define M25P80_GET_CLASS(obj) \
      OBJECT_GET_CLASS(M25P80Class, (obj), TYPE_M25P80)
 
-static void bdrv_sync_complete(void *opaque, int ret)
+static void blk_sync_complete(void *opaque, int ret)
 {
     /* do nothing. Masters do not directly interact with the backing store,
      * only the working copy so no mutexing required.
@@ -287,18 +289,20 @@ static void bdrv_sync_complete(void *opaque, int ret)
 
 static void flash_sync_page(Flash *s, int page)
 {
-    if (s->bdrv) {
-        int bdrv_sector, nb_sectors;
-        QEMUIOVector iov;
+    int blk_sector, nb_sectors;
+    QEMUIOVector iov;
 
-        bdrv_sector = (page * s->pi->page_size) / BDRV_SECTOR_SIZE;
-        nb_sectors = DIV_ROUND_UP(s->pi->page_size, BDRV_SECTOR_SIZE);
-        qemu_iovec_init(&iov, 1);
-        qemu_iovec_add(&iov, s->storage + bdrv_sector * BDRV_SECTOR_SIZE,
-                                                nb_sectors * BDRV_SECTOR_SIZE);
-        bdrv_aio_writev(s->bdrv, bdrv_sector, &iov, nb_sectors,
-                                                bdrv_sync_complete, NULL);
+    if (!s->blk || blk_is_read_only(s->blk)) {
+        return;
     }
+
+    blk_sector = (page * s->pi->page_size) / BDRV_SECTOR_SIZE;
+    nb_sectors = DIV_ROUND_UP(s->pi->page_size, BDRV_SECTOR_SIZE);
+    qemu_iovec_init(&iov, 1);
+    qemu_iovec_add(&iov, s->storage + blk_sector * BDRV_SECTOR_SIZE,
+                   nb_sectors * BDRV_SECTOR_SIZE);
+    blk_aio_writev(s->blk, blk_sector, &iov, nb_sectors, blk_sync_complete,
+                   NULL);
 }
 
 static inline void flash_sync_area(Flash *s, int64_t off, int64_t len)
@@ -306,7 +310,7 @@ static inline void flash_sync_area(Flash *s, int64_t off, int64_t len)
     int64_t start, end, nb_sectors;
     QEMUIOVector iov;
 
-    if (!s->bdrv) {
+    if (!s->blk || blk_is_read_only(s->blk)) {
         return;
     }
 
@@ -317,7 +321,7 @@ static inline void flash_sync_area(Flash *s, int64_t off, int64_t len)
     qemu_iovec_init(&iov, 1);
     qemu_iovec_add(&iov, s->storage + (start * BDRV_SECTOR_SIZE),
                                         nb_sectors * BDRV_SECTOR_SIZE);
-    bdrv_aio_writev(s->bdrv, start, &iov, nb_sectors, bdrv_sync_complete, NULL);
+    blk_aio_writev(s->blk, start, &iov, nb_sectors, blk_sync_complete, NULL);
 }
 
 static void flash_erase(Flash *s, int offset, FlashCMD cmd)
@@ -545,7 +549,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
 
 static int m25p80_cs(SSISlave *ss, bool select)
 {
-    Flash *s = FROM_SSI_SLAVE(Flash, ss);
+    Flash *s = M25P80(ss);
 
     if (select) {
         s->len = 0;
@@ -561,7 +565,7 @@ static int m25p80_cs(SSISlave *ss, bool select)
 
 static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
 {
-    Flash *s = FROM_SSI_SLAVE(Flash, ss);
+    Flash *s = M25P80(ss);
     uint32_t r = 0;
 
     switch (s->state) {
@@ -610,28 +614,25 @@ static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
 static int m25p80_init(SSISlave *ss)
 {
     DriveInfo *dinfo;
-    Flash *s = FROM_SSI_SLAVE(Flash, ss);
+    Flash *s = M25P80(ss);
     M25P80Class *mc = M25P80_GET_CLASS(s);
 
     s->pi = mc->pi;
 
     s->size = s->pi->sector_size * s->pi->n_sectors;
     s->dirty_page = -1;
-    s->storage = qemu_blockalign(s->bdrv, s->size);
+    s->storage = blk_blockalign(s->blk, s->size);
 
+    /* FIXME use a qdev drive property instead of drive_get_next() */
     dinfo = drive_get_next(IF_MTD);
 
-    if (dinfo && dinfo->bdrv) {
+    if (dinfo) {
         DB_PRINT_L(0, "Binding to IF_MTD drive\n");
-        s->bdrv = dinfo->bdrv;
-        if (bdrv_is_read_only(s->bdrv)) {
-            fprintf(stderr, "Can't use a read-only drive");
-            return 1;
-        }
+        s->blk = blk_by_legacy_dinfo(dinfo);
 
         /* FIXME: Move to late init */
-        if (bdrv_read(s->bdrv, 0, s->storage, DIV_ROUND_UP(s->size,
-                                                    BDRV_SECTOR_SIZE))) {
+        if (blk_read(s->blk, 0, s->storage,
+                     DIV_ROUND_UP(s->size, BDRV_SECTOR_SIZE))) {
             fprintf(stderr, "Failed to initialize SPI flash!\n");
             return 1;
         }
@@ -652,7 +653,6 @@ static const VMStateDescription vmstate_m25p80 = {
     .name = "xilinx_spi",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .pre_save = m25p80_pre_save,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(state, Flash),

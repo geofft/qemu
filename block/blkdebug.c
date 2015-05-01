@@ -26,6 +26,10 @@
 #include "qemu/config-file.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
+#include "qapi/qmp/qbool.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qint.h"
+#include "qapi/qmp/qstring.h"
 
 typedef struct BDRVBlkdebugState {
     int state;
@@ -37,7 +41,7 @@ typedef struct BDRVBlkdebugState {
 } BDRVBlkdebugState;
 
 typedef struct BlkdebugAIOCB {
-    BlockDriverAIOCB common;
+    BlockAIOCB common;
     QEMUBH *bh;
     int ret;
 } BlkdebugAIOCB;
@@ -48,11 +52,8 @@ typedef struct BlkdebugSuspendedReq {
     QLIST_ENTRY(BlkdebugSuspendedReq) next;
 } BlkdebugSuspendedReq;
 
-static void blkdebug_aio_cancel(BlockDriverAIOCB *blockacb);
-
 static const AIOCBInfo blkdebug_aiocb_info = {
-    .aiocb_size = sizeof(BlkdebugAIOCB),
-    .cancel     = blkdebug_aio_cancel,
+    .aiocb_size    = sizeof(BlkdebugAIOCB),
 };
 
 enum {
@@ -186,6 +187,16 @@ static const char *event_names[BLKDBG_EVENT_MAX] = {
 
     [BLKDBG_FLUSH_TO_OS]                    = "flush_to_os",
     [BLKDBG_FLUSH_TO_DISK]                  = "flush_to_disk",
+
+    [BLKDBG_PWRITEV_RMW_HEAD]               = "pwritev_rmw.head",
+    [BLKDBG_PWRITEV_RMW_AFTER_HEAD]         = "pwritev_rmw.after_head",
+    [BLKDBG_PWRITEV_RMW_TAIL]               = "pwritev_rmw.tail",
+    [BLKDBG_PWRITEV_RMW_AFTER_TAIL]         = "pwritev_rmw.after_tail",
+    [BLKDBG_PWRITEV]                        = "pwritev",
+    [BLKDBG_PWRITEV_ZERO]                   = "pwritev_zero",
+    [BLKDBG_PWRITEV_DONE]                   = "pwritev_done",
+
+    [BLKDBG_EMPTY_IMAGE_PREPARE]            = "empty_image_prepare",
 };
 
 static int get_event_by_name(const char *name, BlkDebugEvent *event)
@@ -205,6 +216,7 @@ static int get_event_by_name(const char *name, BlkDebugEvent *event)
 struct add_rule_data {
     BDRVBlkdebugState *s;
     int action;
+    Error **errp;
 };
 
 static int add_rule(QemuOpts *opts, void *opaque)
@@ -217,7 +229,11 @@ static int add_rule(QemuOpts *opts, void *opaque)
 
     /* Find the right event for the rule */
     event_name = qemu_opt_get(opts, "event");
-    if (!event_name || get_event_by_name(event_name, &event) < 0) {
+    if (!event_name) {
+        error_setg(d->errp, "Missing event name for rule");
+        return -1;
+    } else if (get_event_by_name(event_name, &event) < 0) {
+        error_setg(d->errp, "Invalid event name \"%s\"", event_name);
         return -1;
     }
 
@@ -271,34 +287,61 @@ static void remove_rule(BlkdebugRule *rule)
     g_free(rule);
 }
 
-static int read_config(BDRVBlkdebugState *s, const char *filename)
+static int read_config(BDRVBlkdebugState *s, const char *filename,
+                       QDict *options, Error **errp)
 {
-    FILE *f;
+    FILE *f = NULL;
     int ret;
     struct add_rule_data d;
+    Error *local_err = NULL;
 
-    f = fopen(filename, "r");
-    if (f == NULL) {
-        return -errno;
+    if (filename) {
+        f = fopen(filename, "r");
+        if (f == NULL) {
+            error_setg_errno(errp, errno, "Could not read blkdebug config file");
+            return -errno;
+        }
+
+        ret = qemu_config_parse(f, config_groups, filename);
+        if (ret < 0) {
+            error_setg(errp, "Could not parse blkdebug config file");
+            ret = -EINVAL;
+            goto fail;
+        }
     }
 
-    ret = qemu_config_parse(f, config_groups, filename);
-    if (ret < 0) {
+    qemu_config_parse_qdict(options, config_groups, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
         goto fail;
     }
 
     d.s = s;
     d.action = ACTION_INJECT_ERROR;
-    qemu_opts_foreach(&inject_error_opts, add_rule, &d, 0);
+    d.errp = &local_err;
+    qemu_opts_foreach(&inject_error_opts, add_rule, &d, 1);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
+        goto fail;
+    }
 
     d.action = ACTION_SET_STATE;
-    qemu_opts_foreach(&set_state_opts, add_rule, &d, 0);
+    qemu_opts_foreach(&set_state_opts, add_rule, &d, 1);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
+        goto fail;
+    }
 
     ret = 0;
 fail:
     qemu_opts_reset(&inject_error_opts);
     qemu_opts_reset(&set_state_opts);
-    fclose(f);
+    if (f) {
+        fclose(f);
+    }
     return ret;
 }
 
@@ -310,7 +353,9 @@ static void blkdebug_parse_filename(const char *filename, QDict *options,
 
     /* Parse the blkdebug: prefix */
     if (!strstart(filename, "blkdebug:", &filename)) {
-        error_setg(errp, "File name string must start with 'blkdebug:'");
+        /* There was no prefix; therefore, all options have to be already
+           present in the QDict (except for the filename) */
+        qdict_put(options, "x-image", qstring_from_str(filename));
         return;
     }
 
@@ -346,6 +391,11 @@ static QemuOptsList runtime_opts = {
             .type = QEMU_OPT_STRING,
             .help = "[internal use only, will be removed]",
         },
+        {
+            .name = "align",
+            .type = QEMU_OPT_SIZE,
+            .help = "Required alignment in bytes",
+        },
         { /* end of list */ }
     },
 };
@@ -356,46 +406,53 @@ static int blkdebug_open(BlockDriverState *bs, QDict *options, int flags,
     BDRVBlkdebugState *s = bs->opaque;
     QemuOpts *opts;
     Error *local_err = NULL;
-    const char *filename, *config;
+    const char *config;
+    uint64_t align;
     int ret;
 
-    opts = qemu_opts_create_nofail(&runtime_opts);
+    opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
     qemu_opts_absorb_qdict(opts, options, &local_err);
-    if (error_is_set(&local_err)) {
+    if (local_err) {
         error_propagate(errp, local_err);
         ret = -EINVAL;
-        goto fail;
+        goto out;
     }
 
-    /* Read rules from config file */
+    /* Read rules from config file or command line options */
     config = qemu_opt_get(opts, "config");
-    if (config) {
-        ret = read_config(s, config);
-        if (ret < 0) {
-            error_setg_errno(errp, -ret, "Could not read blkdebug config file");
-            goto fail;
-        }
+    ret = read_config(s, config, options, errp);
+    if (ret) {
+        goto out;
     }
 
     /* Set initial state */
     s->state = 1;
 
     /* Open the backing file */
-    filename = qemu_opt_get(opts, "x-image");
-    if (filename == NULL) {
-        error_setg(errp, "Could not retrieve image file name");
-        ret = -EINVAL;
-        goto fail;
-    }
-
-    ret = bdrv_file_open(&bs->file, filename, NULL, flags, &local_err);
+    assert(bs->file == NULL);
+    ret = bdrv_open_image(&bs->file, qemu_opt_get(opts, "x-image"), options, "image",
+                          flags | BDRV_O_PROTOCOL, false, &local_err);
     if (ret < 0) {
         error_propagate(errp, local_err);
-        goto fail;
+        goto out;
+    }
+
+    /* Set request alignment */
+    align = qemu_opt_get_size(opts, "align", bs->request_alignment);
+    if (align > 0 && align < INT_MAX && !(align & (align - 1))) {
+        bs->request_alignment = align;
+    } else {
+        error_setg(errp, "Invalid alignment");
+        ret = -EINVAL;
+        goto fail_unref;
     }
 
     ret = 0;
-fail:
+    goto out;
+
+fail_unref:
+    bdrv_unref(bs->file);
+out:
     qemu_opts_del(opts);
     return ret;
 }
@@ -405,44 +462,40 @@ static void error_callback_bh(void *opaque)
     struct BlkdebugAIOCB *acb = opaque;
     qemu_bh_delete(acb->bh);
     acb->common.cb(acb->common.opaque, acb->ret);
-    qemu_aio_release(acb);
+    qemu_aio_unref(acb);
 }
 
-static void blkdebug_aio_cancel(BlockDriverAIOCB *blockacb)
-{
-    BlkdebugAIOCB *acb = container_of(blockacb, BlkdebugAIOCB, common);
-    qemu_aio_release(acb);
-}
-
-static BlockDriverAIOCB *inject_error(BlockDriverState *bs,
-    BlockDriverCompletionFunc *cb, void *opaque, BlkdebugRule *rule)
+static BlockAIOCB *inject_error(BlockDriverState *bs,
+    BlockCompletionFunc *cb, void *opaque, BlkdebugRule *rule)
 {
     BDRVBlkdebugState *s = bs->opaque;
     int error = rule->options.inject.error;
     struct BlkdebugAIOCB *acb;
     QEMUBH *bh;
+    bool immediately = rule->options.inject.immediately;
 
     if (rule->options.inject.once) {
-        QSIMPLEQ_INIT(&s->active_rules);
+        QSIMPLEQ_REMOVE(&s->active_rules, rule, BlkdebugRule, active_next);
+        remove_rule(rule);
     }
 
-    if (rule->options.inject.immediately) {
+    if (immediately) {
         return NULL;
     }
 
     acb = qemu_aio_get(&blkdebug_aiocb_info, bs, cb, opaque);
     acb->ret = -error;
 
-    bh = qemu_bh_new(error_callback_bh, acb);
+    bh = aio_bh_new(bdrv_get_aio_context(bs), error_callback_bh, acb);
     acb->bh = bh;
     qemu_bh_schedule(bh);
 
     return &acb->common;
 }
 
-static BlockDriverAIOCB *blkdebug_aio_readv(BlockDriverState *bs,
+static BlockAIOCB *blkdebug_aio_readv(BlockDriverState *bs,
     int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
-    BlockDriverCompletionFunc *cb, void *opaque)
+    BlockCompletionFunc *cb, void *opaque)
 {
     BDRVBlkdebugState *s = bs->opaque;
     BlkdebugRule *rule = NULL;
@@ -462,9 +515,9 @@ static BlockDriverAIOCB *blkdebug_aio_readv(BlockDriverState *bs,
     return bdrv_aio_readv(bs->file, sector_num, qiov, nb_sectors, cb, opaque);
 }
 
-static BlockDriverAIOCB *blkdebug_aio_writev(BlockDriverState *bs,
+static BlockAIOCB *blkdebug_aio_writev(BlockDriverState *bs,
     int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
-    BlockDriverCompletionFunc *cb, void *opaque)
+    BlockCompletionFunc *cb, void *opaque)
 {
     BDRVBlkdebugState *s = bs->opaque;
     BlkdebugRule *rule = NULL;
@@ -482,6 +535,25 @@ static BlockDriverAIOCB *blkdebug_aio_writev(BlockDriverState *bs,
     }
 
     return bdrv_aio_writev(bs->file, sector_num, qiov, nb_sectors, cb, opaque);
+}
+
+static BlockAIOCB *blkdebug_aio_flush(BlockDriverState *bs,
+    BlockCompletionFunc *cb, void *opaque)
+{
+    BDRVBlkdebugState *s = bs->opaque;
+    BlkdebugRule *rule = NULL;
+
+    QSIMPLEQ_FOREACH(rule, &s->active_rules, active_next) {
+        if (rule->options.inject.sector == -1) {
+            break;
+        }
+    }
+
+    if (rule && rule->options.inject.error) {
+        return inject_error(bs, cb, opaque, rule);
+    }
+
+    return bdrv_aio_flush(bs->file, cb, opaque);
 }
 
 
@@ -649,6 +721,55 @@ static int64_t blkdebug_getlength(BlockDriverState *bs)
     return bdrv_getlength(bs->file);
 }
 
+static void blkdebug_refresh_filename(BlockDriverState *bs)
+{
+    QDict *opts;
+    const QDictEntry *e;
+    bool force_json = false;
+
+    for (e = qdict_first(bs->options); e; e = qdict_next(bs->options, e)) {
+        if (strcmp(qdict_entry_key(e), "config") &&
+            strcmp(qdict_entry_key(e), "x-image") &&
+            strcmp(qdict_entry_key(e), "image") &&
+            strncmp(qdict_entry_key(e), "image.", strlen("image.")))
+        {
+            force_json = true;
+            break;
+        }
+    }
+
+    if (force_json && !bs->file->full_open_options) {
+        /* The config file cannot be recreated, so creating a plain filename
+         * is impossible */
+        return;
+    }
+
+    if (!force_json && bs->file->exact_filename[0]) {
+        snprintf(bs->exact_filename, sizeof(bs->exact_filename),
+                 "blkdebug:%s:%s",
+                 qdict_get_try_str(bs->options, "config") ?: "",
+                 bs->file->exact_filename);
+    }
+
+    opts = qdict_new();
+    qdict_put_obj(opts, "driver", QOBJECT(qstring_from_str("blkdebug")));
+
+    QINCREF(bs->file->full_open_options);
+    qdict_put_obj(opts, "image", QOBJECT(bs->file->full_open_options));
+
+    for (e = qdict_first(bs->options); e; e = qdict_next(bs->options, e)) {
+        if (strcmp(qdict_entry_key(e), "x-image") &&
+            strcmp(qdict_entry_key(e), "image") &&
+            strncmp(qdict_entry_key(e), "image.", strlen("image.")))
+        {
+            qobject_incref(qdict_entry_value(e));
+            qdict_put_obj(opts, qdict_entry_key(e), qdict_entry_value(e));
+        }
+    }
+
+    bs->full_open_options = opts;
+}
+
 static BlockDriver bdrv_blkdebug = {
     .format_name            = "blkdebug",
     .protocol_name          = "blkdebug",
@@ -658,9 +779,11 @@ static BlockDriver bdrv_blkdebug = {
     .bdrv_file_open         = blkdebug_open,
     .bdrv_close             = blkdebug_close,
     .bdrv_getlength         = blkdebug_getlength,
+    .bdrv_refresh_filename  = blkdebug_refresh_filename,
 
     .bdrv_aio_readv         = blkdebug_aio_readv,
     .bdrv_aio_writev        = blkdebug_aio_writev,
+    .bdrv_aio_flush         = blkdebug_aio_flush,
 
     .bdrv_debug_event           = blkdebug_debug_event,
     .bdrv_debug_breakpoint      = blkdebug_debug_breakpoint,

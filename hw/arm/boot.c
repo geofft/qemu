@@ -16,6 +16,7 @@
 #include "elf.h"
 #include "sysemu/device_tree.h"
 #include "qemu/config-file.h"
+#include "exec/address-spaces.h"
 
 /* Kernel boot protocol is specified in the kernel docs
  * Documentation/arm/Booting and Documentation/arm64/booting.txt
@@ -169,12 +170,17 @@ static void default_reset_secondary(ARMCPU *cpu,
 {
     CPUARMState *env = &cpu->env;
 
-    stl_phys_notdirty(info->smp_bootreg_addr, 0);
+    stl_phys_notdirty(&address_space_memory, info->smp_bootreg_addr, 0);
     env->regs[15] = info->smp_loader_start;
 }
 
+static inline bool have_dtb(const struct arm_boot_info *info)
+{
+    return info->dtb_filename || info->get_dtb;
+}
+
 #define WRITE_WORD(p, value) do { \
-    stl_phys_notdirty(p, value);  \
+    stl_phys_notdirty(&address_space_memory, p, value);  \
     p += 4;                       \
 } while (0)
 
@@ -306,7 +312,28 @@ static void set_kernel_args_old(const struct arm_boot_info *info)
     }
 }
 
-static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo)
+/**
+ * load_dtb() - load a device tree binary image into memory
+ * @addr:       the address to load the image at
+ * @binfo:      struct describing the boot environment
+ * @addr_limit: upper limit of the available memory area at @addr
+ *
+ * Load a device tree supplied by the machine or by the user  with the
+ * '-dtb' command line option, and put it at offset @addr in target
+ * memory.
+ *
+ * If @addr_limit contains a meaningful value (i.e., it is strictly greater
+ * than @addr), the device tree is only loaded if its size does not exceed
+ * the limit.
+ *
+ * Returns: the size of the device tree image on success,
+ *          0 if the image size exceeds the limit,
+ *          -1 on errors.
+ *
+ * Note: Must not be called unless have_dtb(binfo) is true.
+ */
+static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
+                    hwaddr addr_limit)
 {
     void *fdt = NULL;
     int size, rc;
@@ -327,12 +354,21 @@ static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo)
             goto fail;
         }
         g_free(filename);
-    } else if (binfo->get_dtb) {
+    } else {
         fdt = binfo->get_dtb(binfo, &size);
         if (!fdt) {
             fprintf(stderr, "Board was unable to create a dtb blob\n");
             goto fail;
         }
+    }
+
+    if (addr_limit > addr && size > (addr_limit - addr)) {
+        /* Installing the device tree blob at addr would exceed addr_limit.
+         * Whether this constitutes failure is up to the caller to decide,
+         * so just return 0 as size, i.e., no error.
+         */
+        g_free(fdt);
+        return 0;
     }
 
     acells = qemu_fdt_getprop_cell(fdt, "/", "#address-cells");
@@ -390,11 +426,14 @@ static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo)
 
     qemu_fdt_dumpdtb(fdt, size);
 
-    cpu_physical_memory_write(addr, fdt, size);
+    /* Put the DTB into the memory map as a ROM image: this will ensure
+     * the DTB is copied again upon reset, even if addr points into RAM.
+     */
+    rom_add_blob_fixed("dtb", fdt, size, addr);
 
     g_free(fdt);
 
-    return 0;
+    return size;
 
 fail:
     g_free(fdt);
@@ -411,9 +450,41 @@ static void do_cpu_reset(void *opaque)
     if (info) {
         if (!info->is_linux) {
             /* Jump to the entry point.  */
-            env->regs[15] = info->entry & 0xfffffffe;
-            env->thumb = info->entry & 1;
+            if (env->aarch64) {
+                env->pc = info->entry;
+            } else {
+                env->regs[15] = info->entry & 0xfffffffe;
+                env->thumb = info->entry & 1;
+            }
         } else {
+            /* If we are booting Linux then we need to check whether we are
+             * booting into secure or non-secure state and adjust the state
+             * accordingly.  Out of reset, ARM is defined to be in secure state
+             * (SCR.NS = 0), we change that here if non-secure boot has been
+             * requested.
+             */
+            if (arm_feature(env, ARM_FEATURE_EL3)) {
+                /* AArch64 is defined to come out of reset into EL3 if enabled.
+                 * If we are booting Linux then we need to adjust our EL as
+                 * Linux expects us to be in EL2 or EL1.  AArch32 resets into
+                 * SVC, which Linux expects, so no privilege/exception level to
+                 * adjust.
+                 */
+                if (env->aarch64) {
+                    if (arm_feature(env, ARM_FEATURE_EL2)) {
+                        env->pstate = PSTATE_MODE_EL2h;
+                    } else {
+                        env->pstate = PSTATE_MODE_EL1h;
+                    }
+                }
+
+                /* Set to non-secure if not a secure boot */
+                if (!info->secure_boot) {
+                    /* Linux expects non-secure state */
+                    env->cp15.scr_el3 |= SCR_NS;
+                }
+            }
+
             if (CPU(cpu) == first_cpu) {
                 if (env->aarch64) {
                     env->pc = info->loader_start;
@@ -421,7 +492,7 @@ static void do_cpu_reset(void *opaque)
                     env->regs[15] = info->loader_start;
                 }
 
-                if (!info->dtb_filename) {
+                if (!have_dtb(info)) {
                     if (old_param) {
                         set_kernel_args_old(info);
                     } else {
@@ -435,21 +506,119 @@ static void do_cpu_reset(void *opaque)
     }
 }
 
+/**
+ * load_image_to_fw_cfg() - Load an image file into an fw_cfg entry identified
+ *                          by key.
+ * @fw_cfg:         The firmware config instance to store the data in.
+ * @size_key:       The firmware config key to store the size of the loaded
+ *                  data under, with fw_cfg_add_i32().
+ * @data_key:       The firmware config key to store the loaded data under,
+ *                  with fw_cfg_add_bytes().
+ * @image_name:     The name of the image file to load. If it is NULL, the
+ *                  function returns without doing anything.
+ * @try_decompress: Whether the image should be decompressed (gunzipped) before
+ *                  adding it to fw_cfg. If decompression fails, the image is
+ *                  loaded as-is.
+ *
+ * In case of failure, the function prints an error message to stderr and the
+ * process exits with status 1.
+ */
+static void load_image_to_fw_cfg(FWCfgState *fw_cfg, uint16_t size_key,
+                                 uint16_t data_key, const char *image_name,
+                                 bool try_decompress)
+{
+    size_t size = -1;
+    uint8_t *data;
+
+    if (image_name == NULL) {
+        return;
+    }
+
+    if (try_decompress) {
+        size = load_image_gzipped_buffer(image_name,
+                                         LOAD_IMAGE_MAX_GUNZIP_BYTES, &data);
+    }
+
+    if (size == (size_t)-1) {
+        gchar *contents;
+        gsize length;
+
+        if (!g_file_get_contents(image_name, &contents, &length, NULL)) {
+            fprintf(stderr, "failed to load \"%s\"\n", image_name);
+            exit(1);
+        }
+        size = length;
+        data = (uint8_t *)contents;
+    }
+
+    fw_cfg_add_i32(fw_cfg, size_key, size);
+    fw_cfg_add_bytes(fw_cfg, data_key, data, size);
+}
+
 void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
 {
-    CPUState *cs = CPU(cpu);
+    CPUState *cs;
     int kernel_size;
     int initrd_size;
     int is_linux = 0;
-    uint64_t elf_entry;
+    uint64_t elf_entry, elf_low_addr, elf_high_addr;
+    int elf_machine;
     hwaddr entry, kernel_load_offset;
     int big_endian;
     static const ARMInsnFixup *primary_loader;
 
+    /* CPU objects (unlike devices) are not automatically reset on system
+     * reset, so we must always register a handler to do so. If we're
+     * actually loading a kernel, the handler is also responsible for
+     * arranging that we start it correctly.
+     */
+    for (cs = CPU(cpu); cs; cs = CPU_NEXT(cs)) {
+        qemu_register_reset(do_cpu_reset, ARM_CPU(cs));
+    }
+
     /* Load the kernel.  */
-    if (!info->kernel_filename) {
-        /* If no kernel specified, do nothing; we will start from address 0
-         * (typically a boot ROM image) in the same way as hardware.
+    if (!info->kernel_filename || info->firmware_loaded) {
+
+        if (have_dtb(info)) {
+            /* If we have a device tree blob, but no kernel to supply it to (or
+             * the kernel is supposed to be loaded by the bootloader), copy the
+             * DTB to the base of RAM for the bootloader to pick up.
+             */
+            if (load_dtb(info->loader_start, info, 0) < 0) {
+                exit(1);
+            }
+        }
+
+        if (info->kernel_filename) {
+            FWCfgState *fw_cfg;
+            bool try_decompressing_kernel;
+
+            fw_cfg = fw_cfg_find();
+            try_decompressing_kernel = arm_feature(&cpu->env,
+                                                   ARM_FEATURE_AARCH64);
+
+            /* Expose the kernel, the command line, and the initrd in fw_cfg.
+             * We don't process them here at all, it's all left to the
+             * firmware.
+             */
+            load_image_to_fw_cfg(fw_cfg,
+                                 FW_CFG_KERNEL_SIZE, FW_CFG_KERNEL_DATA,
+                                 info->kernel_filename,
+                                 try_decompressing_kernel);
+            load_image_to_fw_cfg(fw_cfg,
+                                 FW_CFG_INITRD_SIZE, FW_CFG_INITRD_DATA,
+                                 info->initrd_filename, false);
+
+            if (info->kernel_cmdline) {
+                fw_cfg_add_i32(fw_cfg, FW_CFG_CMDLINE_SIZE,
+                               strlen(info->kernel_cmdline) + 1);
+                fw_cfg_add_string(fw_cfg, FW_CFG_CMDLINE_DATA,
+                                  info->kernel_cmdline);
+            }
+        }
+
+        /* We will start from address 0 (typically a boot ROM image) in the
+         * same way as hardware.
          */
         return;
     }
@@ -457,9 +626,11 @@ void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
         primary_loader = bootloader_aarch64;
         kernel_load_offset = KERNEL64_LOAD_ADDR;
+        elf_machine = EM_AARCH64;
     } else {
         primary_loader = bootloader;
         kernel_load_offset = KERNEL_LOAD_ADDR;
+        elf_machine = EM_ARM;
     }
 
     info->dtb_filename = qemu_opt_get(qemu_get_machine_opts(), "dtb");
@@ -495,11 +666,36 @@ void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
 
     /* Assume that raw images are linux kernels, and ELF images are not.  */
     kernel_size = load_elf(info->kernel_filename, NULL, NULL, &elf_entry,
-                           NULL, NULL, big_endian, ELF_MACHINE, 1);
+                           &elf_low_addr, &elf_high_addr, big_endian,
+                           elf_machine, 1);
+    if (kernel_size > 0 && have_dtb(info)) {
+        /* If there is still some room left at the base of RAM, try and put
+         * the DTB there like we do for images loaded with -bios or -pflash.
+         */
+        if (elf_low_addr > info->loader_start
+            || elf_high_addr < info->loader_start) {
+            /* Pass elf_low_addr as address limit to load_dtb if it may be
+             * pointing into RAM, otherwise pass '0' (no limit)
+             */
+            if (elf_low_addr < info->loader_start) {
+                elf_low_addr = 0;
+            }
+            if (load_dtb(info->loader_start, info, elf_low_addr) < 0) {
+                exit(1);
+            }
+        }
+    }
     entry = elf_entry;
     if (kernel_size < 0) {
         kernel_size = load_uimage(info->kernel_filename, &entry, NULL,
-                                  &is_linux);
+                                  &is_linux, NULL, NULL);
+    }
+    /* On aarch64, it's the bootloader's job to uncompress the kernel. */
+    if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64) && kernel_size < 0) {
+        entry = info->loader_start + kernel_load_offset;
+        kernel_size = load_image_gzipped(info->kernel_filename, entry,
+                                         info->ram_size - kernel_load_offset);
+        is_linux = 1;
     }
     if (kernel_size < 0) {
         entry = info->loader_start + kernel_load_offset;
@@ -542,14 +738,14 @@ void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
         /* for device tree boot, we pass the DTB directly in r2. Otherwise
          * we point to the kernel args.
          */
-        if (info->dtb_filename || info->get_dtb) {
+        if (have_dtb(info)) {
             /* Place the DTB after the initrd in memory. Note that some
              * kernels will trash anything in the 4K page the initrd
              * ends in, so make sure the DTB isn't caught up in that.
              */
             hwaddr dtb_start = QEMU_ALIGN_UP(info->initrd_start + initrd_size,
                                              4096);
-            if (load_dtb(dtb_start, info)) {
+            if (load_dtb(dtb_start, info, 0) < 0) {
                 exit(1);
             }
             fixupcontext[FIXUP_ARGPTR] = dtb_start;
@@ -573,9 +769,7 @@ void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
     }
     info->is_linux = is_linux;
 
-    for (; cs; cs = CPU_NEXT(cs)) {
-        cpu = ARM_CPU(cs);
-        cpu->env.boot_info = info;
-        qemu_register_reset(do_cpu_reset, cpu);
+    for (cs = CPU(cpu); cs; cs = CPU_NEXT(cs)) {
+        ARM_CPU(cs)->env.boot_info = info;
     }
 }

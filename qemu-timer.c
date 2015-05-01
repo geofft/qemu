@@ -22,13 +22,9 @@
  * THE SOFTWARE.
  */
 
-#include "sysemu/sysemu.h"
-#include "monitor/monitor.h"
-#include "ui/console.h"
-
-#include "hw/hw.h"
-
+#include "qemu/main-loop.h"
 #include "qemu/timer.h"
+
 #ifdef CONFIG_POSIX
 #include <pthread.h>
 #endif
@@ -56,7 +52,7 @@ typedef struct QEMUClock {
 } QEMUClock;
 
 QEMUTimerListGroup main_loop_tlg;
-QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
+static QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
 
 /* A QEMUTimerList is a list of timers attached to a clock. More
  * than one QEMUTimerList can be attached to each clock, for instance
@@ -125,6 +121,9 @@ void timerlist_free(QEMUTimerList *timer_list)
 static void qemu_clock_init(QEMUClockType type)
 {
     QEMUClock *clock = qemu_clock_ptr(type);
+
+    /* Assert that the clock of type TYPE has not been initialized yet. */
+    assert(main_loop_tlg.tl[type] == NULL);
 
     clock->type = type;
     clock->enabled = true;
@@ -311,7 +310,14 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
     } else {
         struct timespec ts;
-        ts.tv_sec = timeout / 1000000000LL;
+        int64_t tvsec = timeout / 1000000000LL;
+        /* Avoid possibly overflowing and specifying a negative number of
+         * seconds, which would turn a very long timeout into a busy-wait.
+         */
+        if (tvsec > (int64_t)INT32_MAX) {
+            tvsec = INT32_MAX;
+        }
+        ts.tv_sec = tvsec;
         ts.tv_nsec = timeout % 1000000000LL;
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
@@ -321,15 +327,21 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 }
 
 
-void timer_init(QEMUTimer *ts,
-                QEMUTimerList *timer_list, int scale,
-                QEMUTimerCB *cb, void *opaque)
+void timer_init_tl(QEMUTimer *ts,
+                   QEMUTimerList *timer_list, int scale,
+                   QEMUTimerCB *cb, void *opaque)
 {
     ts->timer_list = timer_list;
     ts->cb = cb;
     ts->opaque = opaque;
     ts->scale = scale;
     ts->expire_time = -1;
+}
+
+void timer_deinit(QEMUTimer *ts)
+{
+    assert(ts->expire_time == -1);
+    ts->timer_list = NULL;
 }
 
 void timer_free(QEMUTimer *ts)
@@ -388,9 +400,11 @@ void timer_del(QEMUTimer *ts)
 {
     QEMUTimerList *timer_list = ts->timer_list;
 
-    qemu_mutex_lock(&timer_list->active_timers_lock);
-    timer_del_locked(timer_list, ts);
-    qemu_mutex_unlock(&timer_list->active_timers_lock);
+    if (timer_list) {
+        qemu_mutex_lock(&timer_list->active_timers_lock);
+        timer_del_locked(timer_list, ts);
+        qemu_mutex_unlock(&timer_list->active_timers_lock);
+    }
 }
 
 /* modify the current timer so that it will be fired when current_time
@@ -563,6 +577,8 @@ int64_t qemu_clock_get_ns(QEMUClockType type)
             notifier_list_notify(&clock->reset_notifiers, &now);
         }
         return now;
+    case QEMU_CLOCK_VIRTUAL_RT:
+        return cpu_get_clock();
     }
 }
 

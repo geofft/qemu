@@ -143,11 +143,32 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
     unsigned long mem_size;
     DeviceState *dev;
     SysBusDevice *busdev;
+    ObjectClass *cpu_oc;
+
+    cpu_oc = cpu_class_by_name(TYPE_ARM_CPU, "cortex-a9");
+    assert(cpu_oc);
 
     for (n = 0; n < EXYNOS4210_NCPUS; n++) {
-        s->cpu[n] = cpu_arm_init("cortex-a9");
-        if (!s->cpu[n]) {
-            fprintf(stderr, "Unable to find CPU %d definition\n", n);
+        Object *cpuobj = object_new(object_class_get_name(cpu_oc));
+        Error *err = NULL;
+
+        /* By default A9 CPUs have EL3 enabled.  This board does not currently
+         * support EL3 so the CPU EL3 property is disabled before realization.
+         */
+        if (object_property_find(cpuobj, "has_el3", NULL)) {
+            object_property_set_bool(cpuobj, false, "has_el3", &err);
+            if (err) {
+                error_report_err(err);
+                exit(1);
+            }
+        }
+
+        s->cpu[n] = ARM_CPU(cpuobj);
+        object_property_set_int(cpuobj, EXYNOS4210_SMP_PRIVATE_BASE_ADDR,
+                                "reset-cbar", &error_abort);
+        object_property_set_bool(cpuobj, true, "realized", &err);
+        if (err) {
+            error_report_err(err);
             exit(1);
         }
     }
@@ -238,7 +259,7 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
 
     /* Internal ROM */
     memory_region_init_ram(&s->irom_mem, NULL, "exynos4210.irom",
-                           EXYNOS4210_IROM_SIZE);
+                           EXYNOS4210_IROM_SIZE, &error_abort);
     vmstate_register_ram_global(&s->irom_mem);
     memory_region_set_readonly(&s->irom_mem, true);
     memory_region_add_subregion(system_mem, EXYNOS4210_IROM_BASE_ADDR,
@@ -254,7 +275,7 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
 
     /* Internal RAM */
     memory_region_init_ram(&s->iram_mem, NULL, "exynos4210.iram",
-                           EXYNOS4210_IRAM_SIZE);
+                           EXYNOS4210_IRAM_SIZE, &error_abort);
     vmstate_register_ram_global(&s->iram_mem);
     memory_region_add_subregion(system_mem, EXYNOS4210_IRAM_BASE_ADDR,
                                 &s->iram_mem);
@@ -263,13 +284,14 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
     mem_size = ram_size;
     if (mem_size > EXYNOS4210_DRAM_MAX_SIZE) {
         memory_region_init_ram(&s->dram1_mem, NULL, "exynos4210.dram1",
-                mem_size - EXYNOS4210_DRAM_MAX_SIZE);
+                mem_size - EXYNOS4210_DRAM_MAX_SIZE, &error_abort);
         vmstate_register_ram_global(&s->dram1_mem);
         memory_region_add_subregion(system_mem, EXYNOS4210_DRAM1_BASE_ADDR,
                 &s->dram1_mem);
         mem_size = EXYNOS4210_DRAM_MAX_SIZE;
     }
-    memory_region_init_ram(&s->dram0_mem, NULL, "exynos4210.dram0", mem_size);
+    memory_region_init_ram(&s->dram0_mem, NULL, "exynos4210.dram0", mem_size,
+                           &error_abort);
     vmstate_register_ram_global(&s->dram0_mem);
     memory_region_add_subregion(system_mem, EXYNOS4210_DRAM0_BASE_ADDR,
             &s->dram0_mem);
@@ -326,7 +348,7 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_connect_irq(busdev, 0, i2c_irq);
         sysbus_mmio_map(busdev, 0, addr);
-        s->i2c_if[n] = (i2c_bus *)qdev_get_child_bus(dev, "i2c");
+        s->i2c_if[n] = (I2CBus *)qdev_get_child_bus(dev, "i2c");
     }
 
 

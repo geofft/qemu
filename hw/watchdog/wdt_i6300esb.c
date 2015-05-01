@@ -125,8 +125,14 @@ static void i6300esb_restart_timer(I6300State *d, int stage)
     else
         timeout <<= 5;
 
-    /* Get the timeout in units of ticks_per_sec. */
-    timeout = get_ticks_per_sec() * timeout / 33000000;
+    /* Get the timeout in units of ticks_per_sec.
+     *
+     * ticks_per_sec is typically 10^9 == 0x3B9ACA00 (30 bits), with
+     * 20 bits of user supplied preload, and 15 bits of scale, the
+     * multiply here can exceed 64-bits, before we divide by 33MHz, so
+     * we use a higher-precision intermediate result.
+     */
+    timeout = muldiv64(get_ticks_per_sec(), timeout, 33000000);
 
     i6300esb_debug("stage %d, timeout %" PRIi64 "\n", d->stage, timeout);
 
@@ -369,7 +375,7 @@ static const MemoryRegionOps i6300esb_ops = {
             i6300esb_mem_writel,
         },
     },
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
 static const VMStateDescription vmstate_i6300esb = {
@@ -379,18 +385,18 @@ static const VMStateDescription vmstate_i6300esb = {
      * version_id to be set for every build. This eventually broke
      * migration.
      *
-     * To correct this without breaking old->new migration for older versions
-     * of QEMU, we've set version_id to a value high enough to exceed all past
-     * values of sizeof(I6300State) across various build environments, and have
-     * reset minimum_version_id_old/minimum_version_id to 1, since this VMSD
-     * has never changed and thus can accept all past versions.
+     * To correct this without breaking old->new migration for older
+     * versions of QEMU, we've set version_id to a value high enough
+     * to exceed all past values of sizeof(I6300State) across various
+     * build environments, and have reset minimum_version_id to 1,
+     * since this VMSD has never changed and thus can accept all past
+     * versions.
      *
      * For future changes we can treat these values as we normally would.
      */
     .version_id = 10000,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, I6300State),
         VMSTATE_INT32(reboot_enabled, I6300State),
         VMSTATE_INT32(clock_scale, I6300State),
@@ -398,7 +404,7 @@ static const VMStateDescription vmstate_i6300esb = {
         VMSTATE_INT32(free_run, I6300State),
         VMSTATE_INT32(locked, I6300State),
         VMSTATE_INT32(enabled, I6300State),
-        VMSTATE_TIMER(timer, I6300State),
+        VMSTATE_TIMER_PTR(timer, I6300State),
         VMSTATE_UINT32(timer1_preload, I6300State),
         VMSTATE_UINT32(timer2_preload, I6300State),
         VMSTATE_INT32(stage, I6300State),
@@ -408,7 +414,7 @@ static const VMStateDescription vmstate_i6300esb = {
     }
 };
 
-static int i6300esb_init(PCIDevice *dev)
+static void i6300esb_realize(PCIDevice *dev, Error **errp)
 {
     I6300State *d = DO_UPCAST(I6300State, dev, dev);
 
@@ -421,15 +427,6 @@ static int i6300esb_init(PCIDevice *dev)
                           "i6300esb", 0x10);
     pci_register_bar(&d->dev, 0, 0, &d->io_mem);
     /* qemu_register_coalesced_mmio (addr, 0x10); ? */
-
-    return 0;
-}
-
-static void i6300esb_exit(PCIDevice *dev)
-{
-    I6300State *d = DO_UPCAST(I6300State, dev, dev);
-
-    memory_region_destroy(&d->io_mem);
 }
 
 static WatchdogTimerModel model = {
@@ -444,8 +441,7 @@ static void i6300esb_class_init(ObjectClass *klass, void *data)
 
     k->config_read = i6300esb_config_read;
     k->config_write = i6300esb_config_write;
-    k->init = i6300esb_init;
-    k->exit = i6300esb_exit;
+    k->realize = i6300esb_realize;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_ESB_9;
     k->class_id = PCI_CLASS_SYSTEM_OTHER;

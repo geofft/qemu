@@ -23,7 +23,7 @@
  * THE SOFTWARE.
  */
 
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "qemu/error-report.h"
 #include "hw/sysbus.h"
 #include "hw/hw.h"
@@ -55,7 +55,8 @@ static void pc_isa_bios_init(MemoryRegion *rom_memory,
     /* map the last 128KB of the BIOS in ISA space */
     isa_bios_size = MIN(flash_size, 128 * 1024);
     isa_bios = g_malloc(sizeof(*isa_bios));
-    memory_region_init_ram(isa_bios, NULL, "isa-bios", isa_bios_size);
+    memory_region_init_ram(isa_bios, NULL, "isa-bios", isa_bios_size,
+                           &error_abort);
     vmstate_register_ram_global(isa_bios);
     memory_region_add_subregion_overlap(rom_memory,
                                         0x100000 - isa_bios_size,
@@ -72,35 +73,102 @@ static void pc_isa_bios_init(MemoryRegion *rom_memory,
     memory_region_set_readonly(isa_bios, true);
 }
 
-static void pc_system_flash_init(MemoryRegion *rom_memory,
-                                 DriveInfo *pflash_drv)
+#define FLASH_MAP_UNIT_MAX 2
+
+/* We don't have a theoretically justifiable exact lower bound on the base
+ * address of any flash mapping. In practice, the IO-APIC MMIO range is
+ * [0xFEE00000..0xFEE01000[ -- see IO_APIC_DEFAULT_ADDRESS --, leaving free
+ * only 18MB-4KB below 4G. For now, restrict the cumulative mapping to 8MB in
+ * size.
+ */
+#define FLASH_MAP_BASE_MIN ((hwaddr)(0x100000000ULL - 8*1024*1024))
+
+/* This function maps flash drives from 4G downward, in order of their unit
+ * numbers. The mapping starts at unit#0, with unit number increments of 1, and
+ * stops before the first missing flash drive, or before
+ * unit#FLASH_MAP_UNIT_MAX, whichever is reached first.
+ *
+ * Addressing within one flash drive is of course not reversed.
+ *
+ * An error message is printed and the process exits if:
+ * - the size of the backing file for a flash drive is non-positive, or not a
+ *   multiple of the required sector size, or
+ * - the current mapping's base address would fall below FLASH_MAP_BASE_MIN.
+ *
+ * The drive with unit#0 (if available) is mapped at the highest address, and
+ * it is passed to pc_isa_bios_init(). Merging several drives for isa-bios is
+ * not supported.
+ */
+static void pc_system_flash_init(MemoryRegion *rom_memory)
 {
-    BlockDriverState *bdrv;
+    int unit;
+    DriveInfo *pflash_drv;
+    BlockBackend *blk;
     int64_t size;
-    hwaddr phys_addr;
+    char *fatal_errmsg = NULL;
+    hwaddr phys_addr = 0x100000000ULL;
     int sector_bits, sector_size;
     pflash_t *system_flash;
     MemoryRegion *flash_mem;
+    char name[64];
 
-    bdrv = pflash_drv->bdrv;
-    size = bdrv_getlength(pflash_drv->bdrv);
     sector_bits = 12;
     sector_size = 1 << sector_bits;
 
-    if ((size % sector_size) != 0) {
-        fprintf(stderr,
-                "qemu: PC system firmware (pflash) must be a multiple of 0x%x\n",
-                sector_size);
-        exit(1);
+    for (unit = 0;
+         (unit < FLASH_MAP_UNIT_MAX &&
+          (pflash_drv = drive_get(IF_PFLASH, 0, unit)) != NULL);
+         ++unit) {
+        blk = blk_by_legacy_dinfo(pflash_drv);
+        size = blk_getlength(blk);
+        if (size < 0) {
+            fatal_errmsg = g_strdup_printf("failed to get backing file size");
+        } else if (size == 0) {
+            fatal_errmsg = g_strdup_printf("PC system firmware (pflash) "
+                               "cannot have zero size");
+        } else if ((size % sector_size) != 0) {
+            fatal_errmsg = g_strdup_printf("PC system firmware (pflash) "
+                               "must be a multiple of 0x%x", sector_size);
+        } else if (phys_addr < size || phys_addr - size < FLASH_MAP_BASE_MIN) {
+            fatal_errmsg = g_strdup_printf("oversized backing file, pflash "
+                               "segments cannot be mapped under "
+                               TARGET_FMT_plx, FLASH_MAP_BASE_MIN);
+        }
+        if (fatal_errmsg != NULL) {
+            Location loc;
+
+            /* push a new, "none" location on the location stack; overwrite its
+             * contents with the location saved in the option; print the error
+             * (includes location); pop the top
+             */
+            loc_push_none(&loc);
+            if (pflash_drv->opts != NULL) {
+                qemu_opts_loc_restore(pflash_drv->opts);
+            }
+            error_report("%s", fatal_errmsg);
+            loc_pop(&loc);
+            g_free(fatal_errmsg);
+            exit(1);
+        }
+
+        phys_addr -= size;
+
+        /* pflash_cfi01_register() creates a deep copy of the name */
+        snprintf(name, sizeof name, "system.flash%d", unit);
+        system_flash = pflash_cfi01_register(phys_addr, NULL /* qdev */, name,
+                                             size, blk, sector_size,
+                                             size >> sector_bits,
+                                             1      /* width */,
+                                             0x0000 /* id0 */,
+                                             0x0000 /* id1 */,
+                                             0x0000 /* id2 */,
+                                             0x0000 /* id3 */,
+                                             0      /* be */);
+        if (unit == 0) {
+            flash_mem = pflash_cfi01_get_memory(system_flash);
+            pc_isa_bios_init(rom_memory, flash_mem, size);
+        }
     }
-
-    phys_addr = 0x100000000ULL - size;
-    system_flash = pflash_cfi01_register(phys_addr, NULL, "system.flash", size,
-                                         bdrv, sector_size, size >> sector_bits,
-                                         1, 0x0000, 0x0000, 0x0000, 0x0000, 0);
-    flash_mem = pflash_cfi01_get_memory(system_flash);
-
-    pc_isa_bios_init(rom_memory, flash_mem, size);
 }
 
 static void old_pc_system_rom_init(MemoryRegion *rom_memory, bool isapc_ram_fw)
@@ -125,7 +193,7 @@ static void old_pc_system_rom_init(MemoryRegion *rom_memory, bool isapc_ram_fw)
         goto bios_error;
     }
     bios = g_malloc(sizeof(*bios));
-    memory_region_init_ram(bios, NULL, "pc.bios", bios_size);
+    memory_region_init_ram(bios, NULL, "pc.bios", bios_size, &error_abort);
     vmstate_register_ram_global(bios);
     if (!isapc_ram_fw) {
         memory_region_set_readonly(bios, true);
@@ -136,9 +204,7 @@ static void old_pc_system_rom_init(MemoryRegion *rom_memory, bool isapc_ram_fw)
         fprintf(stderr, "qemu: could not load PC BIOS '%s'\n", bios_name);
         exit(1);
     }
-    if (filename) {
-        g_free(filename);
-    }
+    g_free(filename);
 
     /* map the last 128KB of the BIOS in ISA space */
     isa_bios_size = bios_size;
@@ -181,5 +247,5 @@ void pc_system_firmware_init(MemoryRegion *rom_memory, bool isapc_ram_fw)
         exit(1);
     }
 
-    pc_system_flash_init(rom_memory, pflash_drv);
+    pc_system_flash_init(rom_memory);
 }

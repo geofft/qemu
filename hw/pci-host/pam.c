@@ -1,12 +1,12 @@
 /*
- * QEMU i440FX/PIIX3 PCI Bridge Emulation
+ * QEMU Smram/pam logic implementation
  *
  * Copyright (c) 2006 Fabrice Bellard
  * Copyright (c) 2011 Isaku Yamahata <yamahata at valinux co jp>
  *                    VA Linux Systems Japan K.K.
  * Copyright (c) 2012 Jason Baron <jbaron@redhat.com>
  *
- * Split out from piix_pci.c
+ * Split out from piix.c
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -68,7 +68,7 @@ void init_pam(DeviceState *dev, MemoryRegion *ram_memory,
     /* XXX: should distinguish read/write cases */
     memory_region_init_alias(&mem->alias[0], OBJECT(dev), "pam-pci", pci_address_space,
                              start, size);
-    memory_region_init_alias(&mem->alias[2], OBJECT(dev), "pam-pci", pci_address_space,
+    memory_region_init_alias(&mem->alias[2], OBJECT(dev), "pam-pci", ram_memory,
                              start, size);
 
     for (i = 0; i < 4; ++i) {

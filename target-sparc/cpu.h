@@ -5,6 +5,8 @@
 #include "qemu-common.h"
 #include "qemu/bswap.h"
 
+#define ALIGNED_ONLY
+
 #if !defined(TARGET_SPARC64)
 #define TARGET_LONG_BITS 32
 #define TARGET_DPREGS 16
@@ -28,8 +30,6 @@
 #include "exec/cpu-defs.h"
 
 #include "fpu/softfloat.h"
-
-#define TARGET_HAS_ICE 1
 
 #if !defined(TARGET_SPARC64)
 #define ELF_MACHINE     EM_SPARC
@@ -271,6 +271,7 @@ typedef struct sparc_def_t {
 #define CPU_FEATURE_ASR17        (1 << 15)
 #define CPU_FEATURE_CACHE_CTRL   (1 << 16)
 #define CPU_FEATURE_POWERDOWN    (1 << 17)
+#define CPU_FEATURE_CASA         (1 << 18)
 
 #ifndef TARGET_SPARC64
 #define CPU_DEFAULT_FEATURES (CPU_FEATURE_FLOAT | CPU_FEATURE_SWAP |  \
@@ -282,7 +283,8 @@ typedef struct sparc_def_t {
                               CPU_FEATURE_MUL | CPU_FEATURE_DIV |     \
                               CPU_FEATURE_FLUSH | CPU_FEATURE_FSQRT | \
                               CPU_FEATURE_FMUL | CPU_FEATURE_VIS1 |   \
-                              CPU_FEATURE_VIS2 | CPU_FEATURE_FSMULD)
+                              CPU_FEATURE_VIS2 | CPU_FEATURE_FSMULD | \
+                              CPU_FEATURE_CASA)
 enum {
     mmu_us_12, // Ultrasparc < III (64 entry TLB)
     mmu_us_3,  // Ultrasparc III (512 entry TLB)
@@ -421,6 +423,7 @@ struct CPUSPARCState {
 
     CPU_COMMON
 
+    /* Fields from here on are preserved across CPU reset. */
     target_ulong version;
     uint32_t nwindows;
 
@@ -519,9 +522,8 @@ SPARCCPU *cpu_sparc_init(const char *cpu_model);
 void cpu_sparc_set_id(CPUSPARCState *env, unsigned int cpu);
 void sparc_cpu_list(FILE *f, fprintf_function cpu_fprintf);
 /* mmu_helper.c */
-int cpu_sparc_handle_mmu_fault(CPUSPARCState *env1, target_ulong address, int rw,
+int sparc_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int rw,
                                int mmu_idx);
-#define cpu_handle_mmu_fault cpu_sparc_handle_mmu_fault
 target_ulong mmu_probe(CPUSPARCState *env, target_ulong address, int mmulev);
 void dump_mmu(FILE *f, fprintf_function cpu_fprintf, CPUSPARCState *env);
 
@@ -592,14 +594,7 @@ hwaddr cpu_get_phys_page_nofault(CPUSPARCState *env, target_ulong addr,
 int cpu_sparc_signal_handler(int host_signum, void *pinfo, void *puc);
 
 #ifndef NO_CPU_IO_DEFS
-static inline CPUSPARCState *cpu_init(const char *cpu_model)
-{
-    SPARCCPU *cpu = cpu_sparc_init(cpu_model);
-    if (cpu == NULL) {
-        return NULL;
-    }
-    return &cpu->env;
-}
+#define cpu_init(cpu_model) CPU(cpu_sparc_init(cpu_model))
 #endif
 
 #define cpu_exec cpu_sparc_exec
@@ -745,15 +740,6 @@ static inline bool tb_am_enabled(int tb_flags)
 #else
     return tb_flags & TB_FLAG_AM_ENABLED;
 #endif
-}
-
-static inline bool cpu_has_work(CPUState *cpu)
-{
-    SPARCCPU *sparc_cpu = SPARC_CPU(cpu);
-    CPUSPARCState *env1 = &sparc_cpu->env;
-
-    return (cpu->interrupt_request & CPU_INTERRUPT_HARD) &&
-           cpu_interrupts_enabled(env1);
 }
 
 #include "exec/exec-all.h"

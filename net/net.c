@@ -41,13 +41,32 @@
 #include "qapi-visit.h"
 #include "qapi/opts-visitor.h"
 #include "qapi/dealloc-visitor.h"
+#include "sysemu/sysemu.h"
 
 /* Net bridge is currently not supported for W32. */
 #if !defined(_WIN32)
 # define CONFIG_NET_BRIDGE
 #endif
 
+static VMChangeStateEntry *net_change_state_entry;
 static QTAILQ_HEAD(, NetClientState) net_clients;
+
+const char *host_net_devices[] = {
+    "tap",
+    "socket",
+    "dump",
+#ifdef CONFIG_NET_BRIDGE
+    "bridge",
+#endif
+#ifdef CONFIG_SLIRP
+    "user",
+#endif
+#ifdef CONFIG_VDE
+    "vde",
+#endif
+    "vhost-user",
+    NULL,
+};
 
 int default_net = 1;
 
@@ -164,7 +183,6 @@ void qemu_macaddr_default_if_unset(MACAddr *macaddr)
 static char *assign_name(NetClientState *nc1, const char *model)
 {
     NetClientState *nc;
-    char buf[256];
     int id = 0;
 
     QTAILQ_FOREACH(nc, &net_clients, next) {
@@ -176,9 +194,7 @@ static char *assign_name(NetClientState *nc1, const char *model)
         }
     }
 
-    snprintf(buf, sizeof(buf), "%s.%d", model, id);
-
-    return g_strdup(buf);
+    return g_strdup_printf("%s.%d", model, id);
 }
 
 static void qemu_net_client_destructor(NetClientState *nc)
@@ -236,7 +252,7 @@ NICState *qemu_new_nic(NetClientInfo *info,
 {
     NetClientState **peers = conf->peers.ncs;
     NICState *nic;
-    int i, queues = MAX(1, conf->queues);
+    int i, queues = MAX(1, conf->peers.queues);
 
     assert(info->type == NET_CLIENT_OPTIONS_KIND_NIC);
     assert(info->size >= sizeof(NICState));
@@ -308,6 +324,8 @@ void qemu_del_net_client(NetClientState *nc)
     NetClientState *ncs[MAX_QUEUE_NUM];
     int queues, i;
 
+    assert(nc->info->type != NET_CLIENT_OPTIONS_KIND_NIC);
+
     /* If the NetClientState belongs to a multiqueue backend, we will change all
      * other NetClientStates also.
      */
@@ -339,8 +357,6 @@ void qemu_del_net_client(NetClientState *nc)
         return;
     }
 
-    assert(nc->info->type != NET_CLIENT_OPTIONS_KIND_NIC);
-
     for (i = 0; i < queues; i++) {
         qemu_cleanup_net_client(ncs[i]);
         qemu_free_net_client(ncs[i]);
@@ -349,7 +365,7 @@ void qemu_del_net_client(NetClientState *nc)
 
 void qemu_del_nic(NICState *nic)
 {
-    int i, queues = MAX(nic->conf->queues, 1);
+    int i, queues = MAX(nic->conf->peers.queues, 1);
 
     /* If this is a peer NIC and peer has already been deleted, free it now. */
     if (nic->peer_deleted) {
@@ -381,8 +397,69 @@ void qemu_foreach_nic(qemu_nic_foreach func, void *opaque)
     }
 }
 
+bool qemu_has_ufo(NetClientState *nc)
+{
+    if (!nc || !nc->info->has_ufo) {
+        return false;
+    }
+
+    return nc->info->has_ufo(nc);
+}
+
+bool qemu_has_vnet_hdr(NetClientState *nc)
+{
+    if (!nc || !nc->info->has_vnet_hdr) {
+        return false;
+    }
+
+    return nc->info->has_vnet_hdr(nc);
+}
+
+bool qemu_has_vnet_hdr_len(NetClientState *nc, int len)
+{
+    if (!nc || !nc->info->has_vnet_hdr_len) {
+        return false;
+    }
+
+    return nc->info->has_vnet_hdr_len(nc, len);
+}
+
+void qemu_using_vnet_hdr(NetClientState *nc, bool enable)
+{
+    if (!nc || !nc->info->using_vnet_hdr) {
+        return;
+    }
+
+    nc->info->using_vnet_hdr(nc, enable);
+}
+
+void qemu_set_offload(NetClientState *nc, int csum, int tso4, int tso6,
+                          int ecn, int ufo)
+{
+    if (!nc || !nc->info->set_offload) {
+        return;
+    }
+
+    nc->info->set_offload(nc, csum, tso4, tso6, ecn, ufo);
+}
+
+void qemu_set_vnet_hdr_len(NetClientState *nc, int len)
+{
+    if (!nc || !nc->info->set_vnet_hdr_len) {
+        return;
+    }
+
+    nc->info->set_vnet_hdr_len(nc, len);
+}
+
 int qemu_can_send_packet(NetClientState *sender)
 {
+    int vm_running = runstate_is_running();
+
+    if (!vm_running) {
+        return 0;
+    }
+
     if (!sender->peer) {
         return 1;
     }
@@ -421,7 +498,7 @@ ssize_t qemu_deliver_packet(NetClientState *sender,
 
     if (ret == 0) {
         nc->receive_disabled = 1;
-    };
+    }
 
     return ret;
 }
@@ -435,7 +512,8 @@ void qemu_purge_queued_packets(NetClientState *nc)
     qemu_net_queue_purge(nc->peer->incoming_queue, nc);
 }
 
-void qemu_flush_queued_packets(NetClientState *nc)
+static
+void qemu_flush_or_purge_queued_packets(NetClientState *nc, bool purge)
 {
     nc->receive_disabled = 0;
 
@@ -449,7 +527,15 @@ void qemu_flush_queued_packets(NetClientState *nc)
          * the file descriptor (for tap, for example).
          */
         qemu_notify_event();
+    } else if (purge) {
+        /* Unable to empty the queue, purge remaining packets */
+        qemu_net_queue_purge(nc->incoming_queue, nc);
     }
+}
+
+void qemu_flush_queued_packets(NetClientState *nc)
+{
+    qemu_flush_or_purge_queued_packets(nc, false);
 }
 
 static ssize_t qemu_send_packet_async_with_flags(NetClientState *sender,
@@ -581,7 +667,7 @@ int qemu_find_net_clients_except(const char *id, NetClientState **ncs,
         if (nc->info->type == type) {
             continue;
         }
-        if (!strcmp(nc->name, id)) {
+        if (!id || !strcmp(nc->name, id)) {
             if (ret < max) {
                 ncs[ret] = nc;
             }
@@ -734,6 +820,12 @@ static int (* const net_client_init_fun[NET_CLIENT_OPTIONS_KIND_MAX])(
         [NET_CLIENT_OPTIONS_KIND_BRIDGE]    = net_init_bridge,
 #endif
         [NET_CLIENT_OPTIONS_KIND_HUBPORT]   = net_init_hubport,
+#ifdef CONFIG_VHOST_NET_USED
+        [NET_CLIENT_OPTIONS_KIND_VHOST_USER] = net_init_vhost_user,
+#endif
+#ifdef CONFIG_L2TPV3
+        [NET_CLIENT_OPTIONS_KIND_L2TPV3]    = net_init_l2tpv3,
+#endif
 };
 
 
@@ -767,6 +859,12 @@ static int net_client_init1(const void *object, int is_netdev, Error **errp)
         case NET_CLIENT_OPTIONS_KIND_BRIDGE:
 #endif
         case NET_CLIENT_OPTIONS_KIND_HUBPORT:
+#ifdef CONFIG_VHOST_NET_USED
+        case NET_CLIENT_OPTIONS_KIND_VHOST_USER:
+#endif
+#ifdef CONFIG_L2TPV3
+        case NET_CLIENT_OPTIONS_KIND_L2TPV3:
+#endif
             break;
 
         default:
@@ -845,27 +943,17 @@ int net_client_init(QemuOpts *opts, int is_netdev, Error **errp)
 static int net_host_check_device(const char *device)
 {
     int i;
-    const char *valid_param_list[] = { "tap", "socket", "dump"
-#ifdef CONFIG_NET_BRIDGE
-                                       , "bridge"
-#endif
-#ifdef CONFIG_SLIRP
-                                       ,"user"
-#endif
-#ifdef CONFIG_VDE
-                                       ,"vde"
-#endif
-    };
-    for (i = 0; i < sizeof(valid_param_list) / sizeof(char *); i++) {
-        if (!strncmp(valid_param_list[i], device,
-                     strlen(valid_param_list[i])))
+    for (i = 0; host_net_devices[i]; i++) {
+        if (!strncmp(host_net_devices[i], device,
+                     strlen(host_net_devices[i]))) {
             return 1;
+        }
     }
 
     return 0;
 }
 
-void net_host_device_add(Monitor *mon, const QDict *qdict)
+void hmp_host_net_add(Monitor *mon, const QDict *qdict)
 {
     const char *device = qdict_get_str(qdict, "device");
     const char *opts_str = qdict_get_try_str(qdict, "opts");
@@ -882,17 +970,16 @@ void net_host_device_add(Monitor *mon, const QDict *qdict)
         return;
     }
 
-    qemu_opt_set(opts, "type", device);
+    qemu_opt_set(opts, "type", device, &error_abort);
 
     net_client_init(opts, 0, &local_err);
-    if (error_is_set(&local_err)) {
-        qerror_report_err(local_err);
-        error_free(local_err);
+    if (local_err) {
+        error_report_err(local_err);
         monitor_printf(mon, "adding host network device %s failed\n", device);
     }
 }
 
-void net_host_device_remove(Monitor *mon, const QDict *qdict)
+void hmp_host_net_remove(Monitor *mon, const QDict *qdict)
 {
     NetClientState *nc;
     int vlan_id = qdict_get_int(qdict, "vlan_id");
@@ -900,12 +987,16 @@ void net_host_device_remove(Monitor *mon, const QDict *qdict)
 
     nc = net_hub_find_client_by_name(vlan_id, device);
     if (!nc) {
+        error_report("Host network device '%s' on hub '%d' not found",
+                     device, vlan_id);
         return;
     }
-    if (!net_host_check_device(nc->model)) {
-        monitor_printf(mon, "invalid host network device %s\n", device);
+    if (nc->info->type == NET_CLIENT_OPTIONS_KIND_NIC) {
+        error_report("invalid host network device '%s'", device);
         return;
     }
+
+    qemu_del_net_client(nc->peer);
     qemu_del_net_client(nc);
 }
 
@@ -921,17 +1012,17 @@ int qmp_netdev_add(Monitor *mon, const QDict *qdict, QObject **ret)
     QemuOpts *opts;
 
     opts_list = qemu_find_opts_err("netdev", &local_err);
-    if (error_is_set(&local_err)) {
+    if (local_err) {
         goto exit_err;
     }
 
     opts = qemu_opts_from_qdict(opts_list, qdict, &local_err);
-    if (error_is_set(&local_err)) {
+    if (local_err) {
         goto exit_err;
     }
 
     netdev_add(opts, &local_err);
-    if (error_is_set(&local_err)) {
+    if (local_err) {
         qemu_opts_del(opts);
         goto exit_err;
     }
@@ -991,7 +1082,7 @@ RxFilterInfoList *qmp_query_rx_filter(bool has_name, const char *name,
         if (nc->info->type != NET_CLIENT_OPTIONS_KIND_NIC) {
             if (has_name) {
                 error_setg(errp, "net client(%s) isn't a NIC", name);
-                break;
+                return NULL;
             }
             continue;
         }
@@ -1010,18 +1101,22 @@ RxFilterInfoList *qmp_query_rx_filter(bool has_name, const char *name,
         } else if (has_name) {
             error_setg(errp, "net client(%s) doesn't support"
                        " rx-filter querying", name);
+            return NULL;
+        }
+
+        if (has_name) {
             break;
         }
     }
 
-    if (filter_list == NULL && !error_is_set(errp) && has_name) {
+    if (filter_list == NULL && has_name) {
         error_setg(errp, "invalid net client name: %s", name);
     }
 
     return filter_list;
 }
 
-void do_info_network(Monitor *mon, const QDict *qdict)
+void hmp_info_network(Monitor *mon, const QDict *qdict)
 {
     NetClientState *nc, *peer;
     NetClientOptionsKind type;
@@ -1091,6 +1186,22 @@ void qmp_set_link(const char *name, bool up, Error **errp)
     }
 }
 
+static void net_vm_change_state_handler(void *opaque, int running,
+                                        RunState state)
+{
+    /* Complete all queued packets, to guarantee we don't modify
+     * state later when VM is not running.
+     */
+    if (!running) {
+        NetClientState *nc;
+        NetClientState *tmp;
+
+        QTAILQ_FOREACH_SAFE(nc, &net_clients, next, tmp) {
+            qemu_flush_or_purge_queued_packets(nc, true);
+        }
+    }
+}
+
 void net_cleanup(void)
 {
     NetClientState *nc;
@@ -1106,6 +1217,8 @@ void net_cleanup(void)
             qemu_del_net_client(nc);
         }
     }
+
+    qemu_del_vm_change_state_handler(net_change_state_entry);
 }
 
 void net_check_clients(void)
@@ -1155,9 +1268,8 @@ static int net_init_client(QemuOpts *opts, void *dummy)
     Error *local_err = NULL;
 
     net_client_init(opts, 0, &local_err);
-    if (error_is_set(&local_err)) {
-        qerror_report_err(local_err);
-        error_free(local_err);
+    if (local_err) {
+        error_report_err(local_err);
         return -1;
     }
 
@@ -1170,9 +1282,8 @@ static int net_init_netdev(QemuOpts *opts, void *dummy)
     int ret;
 
     ret = net_client_init(opts, 1, &local_err);
-    if (error_is_set(&local_err)) {
-        qerror_report_err(local_err);
-        error_free(local_err);
+    if (local_err) {
+        error_report_err(local_err);
         return -1;
     }
 
@@ -1185,11 +1296,14 @@ int net_init_clients(void)
 
     if (default_net) {
         /* if no clients, we use a default config */
-        qemu_opts_set(net, NULL, "type", "nic");
+        qemu_opts_set(net, NULL, "type", "nic", &error_abort);
 #ifdef CONFIG_SLIRP
-        qemu_opts_set(net, NULL, "type", "user");
+        qemu_opts_set(net, NULL, "type", "user", &error_abort);
 #endif
     }
+
+    net_change_state_entry =
+        qemu_add_vm_change_state_handler(net_vm_change_state_handler, NULL);
 
     QTAILQ_INIT(&net_clients);
 

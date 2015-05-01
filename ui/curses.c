@@ -30,6 +30,7 @@
 
 #include "qemu-common.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "sysemu/sysemu.h"
 
 #define FONT_HEIGHT 16
@@ -274,32 +275,44 @@ static void curses_refresh(DisplayChangeListener *dcl)
         if (qemu_console_is_graphic(NULL)) {
             /* since terminals don't know about key press and release
              * events, we need to emit both for each key received */
-            if (keycode & SHIFT)
-                kbd_put_keycode(SHIFT_CODE);
-            if (keycode & CNTRL)
-                kbd_put_keycode(CNTRL_CODE);
-            if (keycode & ALT)
-                kbd_put_keycode(ALT_CODE);
-            if (keycode & ALTGR) {
-                kbd_put_keycode(SCANCODE_EMUL0);
-                kbd_put_keycode(ALT_CODE);
+            if (keycode & SHIFT) {
+                qemu_input_event_send_key_number(NULL, SHIFT_CODE, true);
+                qemu_input_event_send_key_delay(0);
             }
-            if (keycode & GREY)
-                kbd_put_keycode(GREY_CODE);
-            kbd_put_keycode(keycode & KEY_MASK);
-            if (keycode & GREY)
-                kbd_put_keycode(GREY_CODE);
-            kbd_put_keycode((keycode & KEY_MASK) | KEY_RELEASE);
-            if (keycode & ALTGR) {
-                kbd_put_keycode(SCANCODE_EMUL0);
-                kbd_put_keycode(ALT_CODE | KEY_RELEASE);
+            if (keycode & CNTRL) {
+                qemu_input_event_send_key_number(NULL, CNTRL_CODE, true);
+                qemu_input_event_send_key_delay(0);
             }
-            if (keycode & ALT)
-                kbd_put_keycode(ALT_CODE | KEY_RELEASE);
-            if (keycode & CNTRL)
-                kbd_put_keycode(CNTRL_CODE | KEY_RELEASE);
-            if (keycode & SHIFT)
-                kbd_put_keycode(SHIFT_CODE | KEY_RELEASE);
+            if (keycode & ALT) {
+                qemu_input_event_send_key_number(NULL, ALT_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & ALTGR) {
+                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+
+            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, true);
+            qemu_input_event_send_key_delay(0);
+            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, false);
+            qemu_input_event_send_key_delay(0);
+
+            if (keycode & ALTGR) {
+                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & ALT) {
+                qemu_input_event_send_key_number(NULL, ALT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & CNTRL) {
+                qemu_input_event_send_key_number(NULL, CNTRL_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & SHIFT) {
+                qemu_input_event_send_key_number(NULL, SHIFT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
         } else {
             keysym = curses2qemu[chr];
             if (keysym == -1)

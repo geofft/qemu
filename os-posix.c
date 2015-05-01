@@ -39,19 +39,16 @@
 #include "sysemu/sysemu.h"
 #include "net/slirp.h"
 #include "qemu-options.h"
+#include "qemu/rcu.h"
 
 #ifdef CONFIG_LINUX
 #include <sys/prctl.h>
 #endif
 
-#ifdef __FreeBSD__
-#include <sys/sysctl.h>
-#endif
-
 static struct passwd *user_pwd;
 static const char *chroot_dir;
 static int daemonize;
-static int fds[2];
+static int daemon_pipe;
 
 void os_setup_early_signal_handling(void)
 {
@@ -84,46 +81,17 @@ void os_setup_signal_handling(void)
    running from the build tree this will be "$bindir/../pc-bios".  */
 #define SHARE_SUFFIX "/share/qemu"
 #define BUILD_SUFFIX "/pc-bios"
-char *os_find_datadir(const char *argv0)
+char *os_find_datadir(void)
 {
-    char *dir;
-    char *p = NULL;
+    char *dir, *exec_dir;
     char *res;
-    char buf[PATH_MAX];
     size_t max_len;
 
-#if defined(__linux__)
-    {
-        int len;
-        len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (len > 0) {
-            buf[len] = 0;
-            p = buf;
-        }
+    exec_dir = qemu_get_exec_dir();
+    if (exec_dir == NULL) {
+        return NULL;
     }
-#elif defined(__FreeBSD__)
-    {
-        static int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
-        size_t len = sizeof(buf) - 1;
-
-        *buf = '\0';
-        if (!sysctl(mib, ARRAY_SIZE(mib), buf, &len, NULL, 0) &&
-            *buf) {
-            buf[sizeof(buf) - 1] = '\0';
-            p = buf;
-        }
-    }
-#endif
-    /* If we don't have any way of figuring out the actual executable
-       location then try argv[0].  */
-    if (!p) {
-        p = realpath(argv0, buf);
-        if (!p) {
-            return NULL;
-        }
-    }
-    dir = dirname(p);
-    dir = dirname(dir);
+    dir = dirname(exec_dir);
 
     max_len = strlen(dir) +
         MAX(strlen(SHARE_SUFFIX), strlen(BUILD_SUFFIX)) + 1;
@@ -137,6 +105,7 @@ char *os_find_datadir(const char *argv0)
         }
     }
 
+    g_free(exec_dir);
     return res;
 }
 #undef SHARE_SUFFIX
@@ -236,49 +205,50 @@ static void change_root(void)
 void os_daemonize(void)
 {
     if (daemonize) {
-	pid_t pid;
+        pid_t pid;
+        int fds[2];
 
-	if (pipe(fds) == -1)
-	    exit(1);
-
-	pid = fork();
-	if (pid > 0) {
-	    uint8_t status;
-	    ssize_t len;
-
-	    close(fds[1]);
-
-	again:
-            len = read(fds[0], &status, 1);
-            if (len == -1 && (errno == EINTR))
-                goto again;
-
-            if (len != 1)
-                exit(1);
-            else if (status == 1) {
-                fprintf(stderr, "Could not acquire pidfile: %s\n", strerror(errno));
-                exit(1);
-            } else
-                exit(0);
-	} else if (pid < 0)
+        if (pipe(fds) == -1) {
             exit(1);
+        }
 
-	close(fds[0]);
-	qemu_set_cloexec(fds[1]);
+        pid = fork();
+        if (pid > 0) {
+            uint8_t status;
+            ssize_t len;
 
-	setsid();
+            close(fds[1]);
 
-	pid = fork();
-	if (pid > 0)
-	    exit(0);
-	else if (pid < 0)
-	    exit(1);
+            do {
+                len = read(fds[0], &status, 1);
+            } while (len < 0 && errno == EINTR);
 
-	umask(027);
+            /* only exit successfully if our child actually wrote
+             * a one-byte zero to our pipe, upon successful init */
+            exit(len == 1 && status == 0 ? 0 : 1);
+
+        } else if (pid < 0) {
+            exit(1);
+        }
+
+        close(fds[0]);
+        daemon_pipe = fds[1];
+        qemu_set_cloexec(daemon_pipe);
+
+        setsid();
+
+        pid = fork();
+        if (pid > 0) {
+            exit(0);
+        } else if (pid < 0) {
+            exit(1);
+        }
+        umask(027);
 
         signal(SIGTSTP, SIG_IGN);
         signal(SIGTTOU, SIG_IGN);
         signal(SIGTTIN, SIG_IGN);
+        rcu_after_fork();
     }
 }
 
@@ -287,47 +257,36 @@ void os_setup_post(void)
     int fd = 0;
 
     if (daemonize) {
-	uint8_t status = 0;
-	ssize_t len;
-
-    again1:
-	len = write(fds[1], &status, 1);
-	if (len == -1 && (errno == EINTR))
-	    goto again1;
-
-	if (len != 1)
-	    exit(1);
-
         if (chdir("/")) {
             perror("not able to chdir to /");
             exit(1);
         }
-	TFR(fd = qemu_open("/dev/null", O_RDWR));
-	if (fd == -1)
-	    exit(1);
+        TFR(fd = qemu_open("/dev/null", O_RDWR));
+        if (fd == -1) {
+            exit(1);
+        }
     }
 
     change_root();
     change_process_uid();
 
     if (daemonize) {
+        uint8_t status = 0;
+        ssize_t len;
+
         dup2(fd, 0);
         dup2(fd, 1);
         dup2(fd, 2);
 
         close(fd);
-    }
-}
 
-void os_pidfile_error(void)
-{
-    if (daemonize) {
-        uint8_t status = 1;
-        if (write(fds[1], &status, 1) != 1) {
-            perror("daemonize. Writing to pipe\n");
+        do {        
+            len = write(daemon_pipe, &status, 1);
+        } while (len < 0 && errno == EINTR);
+        if (len != 1) {
+            exit(1);
         }
-    } else
-        fprintf(stderr, "Could not acquire pid file: %s\n", strerror(errno));
+    }
 }
 
 void os_set_line_buffering(void)

@@ -615,9 +615,8 @@ const VMStateDescription vmstate_ne2000 = {
     .name = "ne2000",
     .version_id = 2,
     .minimum_version_id = 0,
-    .minimum_version_id_old = 0,
     .post_load = ne2000_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8_V(rxcr, NE2000State, 2),
         VMSTATE_UINT8(cmd, NE2000State),
         VMSTATE_UINT32(start, NE2000State),
@@ -645,8 +644,7 @@ static const VMStateDescription vmstate_pci_ne2000 = {
     .name = "ne2000",
     .version_id = 3,
     .minimum_version_id = 3,
-    .minimum_version_id_old = 3,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, PCINE2000State),
         VMSTATE_STRUCT(ne2000, PCINE2000State, 0, vmstate_ne2000, NE2000State),
         VMSTATE_END_OF_LIST()
@@ -704,22 +702,14 @@ void ne2000_setup_io(NE2000State *s, DeviceState *dev, unsigned size)
     memory_region_init_io(&s->io, OBJECT(dev), &ne2000_ops, s, "ne2000", size);
 }
 
-static void ne2000_cleanup(NetClientState *nc)
-{
-    NE2000State *s = qemu_get_nic_opaque(nc);
-
-    s->nic = NULL;
-}
-
 static NetClientInfo net_ne2000_info = {
     .type = NET_CLIENT_OPTIONS_KIND_NIC,
     .size = sizeof(NICState),
     .can_receive = ne2000_can_receive,
     .receive = ne2000_receive,
-    .cleanup = ne2000_cleanup,
 };
 
-static int pci_ne2000_init(PCIDevice *pci_dev)
+static void pci_ne2000_realize(PCIDevice *pci_dev, Error **errp)
 {
     PCINE2000State *d = DO_UPCAST(PCINE2000State, dev, pci_dev);
     NE2000State *s;
@@ -739,10 +729,6 @@ static int pci_ne2000_init(PCIDevice *pci_dev)
     s->nic = qemu_new_nic(&net_ne2000_info, &s->c,
                           object_get_typename(OBJECT(pci_dev)), pci_dev->qdev.id, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->c.macaddr.a);
-
-    add_boot_device_path(s->c.bootindex, &pci_dev->qdev, "/ethernet-phy@0");
-
-    return 0;
 }
 
 static void pci_ne2000_exit(PCIDevice *pci_dev)
@@ -750,9 +736,19 @@ static void pci_ne2000_exit(PCIDevice *pci_dev)
     PCINE2000State *d = DO_UPCAST(PCINE2000State, dev, pci_dev);
     NE2000State *s = &d->ne2000;
 
-    memory_region_destroy(&s->io);
     qemu_del_nic(s->nic);
     qemu_free_irq(s->irq);
+}
+
+static void ne2000_instance_init(Object *obj)
+{
+    PCIDevice *pci_dev = PCI_DEVICE(obj);
+    PCINE2000State *d = DO_UPCAST(PCINE2000State, dev, pci_dev);
+    NE2000State *s = &d->ne2000;
+
+    device_add_bootindex_property(obj, &s->c.bootindex,
+                                  "bootindex", "/ethernet-phy@0",
+                                  &pci_dev->qdev, NULL);
 }
 
 static Property ne2000_properties[] = {
@@ -765,7 +761,7 @@ static void ne2000_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = pci_ne2000_init;
+    k->realize = pci_ne2000_realize;
     k->exit = pci_ne2000_exit;
     k->romfile = "efi-ne2k_pci.rom",
     k->vendor_id = PCI_VENDOR_ID_REALTEK;
@@ -781,6 +777,7 @@ static const TypeInfo ne2000_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCINE2000State),
     .class_init    = ne2000_class_init,
+    .instance_init = ne2000_instance_init,
 };
 
 static void ne2000_register_types(void)

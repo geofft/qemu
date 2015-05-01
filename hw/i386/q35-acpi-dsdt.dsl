@@ -48,13 +48,14 @@ DefinitionBlock (
 /****************************************************************
  * PCI Bus definition
  ****************************************************************/
-
     Scope(\_SB) {
         Device(PCI0) {
             Name(_HID, EisaId("PNP0A08"))
             Name(_CID, EisaId("PNP0A03"))
             Name(_ADR, 0x00)
             Name(_UID, 1)
+
+            External(ISA, DeviceObj)
 
             // _OSC: based on sample of ACPI3.0b spec
             Name(SUPP, 0) // PCI _OSC Support Field value
@@ -113,28 +114,7 @@ DefinitionBlock (
         }
     }
 
-#include "acpi-dsdt-pci-crs.dsl"
 #include "acpi-dsdt-hpet.dsl"
-
-
-/****************************************************************
- * VGA
- ****************************************************************/
-
-    Scope(\_SB.PCI0) {
-        Device(VGA) {
-            Name(_ADR, 0x00010000)
-            Method(_S1D, 0, NotSerialized) {
-                Return (0x00)
-            }
-            Method(_S2D, 0, NotSerialized) {
-                Return (0x00)
-            }
-            Method(_S3D, 0, NotSerialized) {
-                Return (0x00)
-            }
-        }
-    }
 
 
 /****************************************************************
@@ -144,8 +124,7 @@ DefinitionBlock (
     Scope(\_SB.PCI0) {
         /* PCI D31:f0 LPC ISA bridge */
         Device(ISA) {
-            /* PCI D31:f0 */
-            Name(_ADR, 0x001f0000)
+            Name (_ADR, 0x001F0000)  // _ADR: Address
 
             /* ICH9 PCI to ISA irq remapping */
             OperationRegion(PIRQ, PCI_Config, 0x60, 0x0C)
@@ -404,25 +383,29 @@ DefinitionBlock (
         define_gsi_link(GSIH, 0, 0x17)
     }
 
+#include "hw/acpi/pc-hotplug.h"
+#define CPU_STATUS_BASE ICH9_CPU_HOTPLUG_IO_BASE
 #include "acpi-dsdt-cpu-hotplug.dsl"
+#include "acpi-dsdt-mem-hotplug.dsl"
 
 
 /****************************************************************
  * General purpose events
  ****************************************************************/
-
     Scope(\_GPE) {
         Name(_HID, "ACPI0006")
 
         Method(_L00) {
         }
         Method(_L01) {
+        }
+        Method(_E02) {
             // CPU hotplug event
             \_SB.PRSC()
         }
-        Method(_L02) {
-        }
-        Method(_L03) {
+        Method(_E03) {
+            // Memory hotplug event
+            \_SB.PCI0.MEMORY_HOTPLUG_DEVICE.MEMORY_SLOT_SCAN_METHOD()
         }
         Method(_L04) {
         }

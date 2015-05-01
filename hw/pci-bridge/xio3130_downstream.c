@@ -50,7 +50,7 @@ static void xio3130_downstream_reset(DeviceState *qdev)
 
     pcie_cap_deverr_reset(d);
     pcie_cap_slot_reset(d);
-    pcie_cap_ari_reset(d);
+    pcie_cap_arifwd_reset(d);
     pci_bridge_reset(qdev);
 }
 
@@ -91,7 +91,7 @@ static int xio3130_downstream_initfn(PCIDevice *d)
     if (rc < 0) {
         goto err_pcie_cap;
     }
-    pcie_cap_ari_init(d);
+    pcie_cap_arifwd_init(d);
     rc = pcie_aer_init(d, XIO3130_AER_OFFSET);
     if (rc < 0) {
         goto err;
@@ -147,11 +147,16 @@ PCIESlot *xio3130_downstream_init(PCIBus *bus, int devfn, bool multifunction,
     return PCIE_SLOT(d);
 }
 
+static Property xio3130_downstream_props[] = {
+    DEFINE_PROP_BIT(COMPAT_PROP_PCP, PCIDevice, cap_present,
+                    QEMU_PCIE_SLTCAP_PCP_BITNR, true),
+    DEFINE_PROP_END_OF_LIST()
+};
+
 static const VMStateDescription vmstate_xio3130_downstream = {
     .name = "xio3130-express-downstream-port",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = pcie_cap_slot_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_PCIE_DEVICE(parent_obj.parent_obj.parent_obj, PCIESlot),
@@ -178,6 +183,7 @@ static void xio3130_downstream_class_init(ObjectClass *klass, void *data)
     dc->desc = "TI X3130 Downstream Port of PCI Express Switch";
     dc->reset = xio3130_downstream_reset;
     dc->vmsd = &vmstate_xio3130_downstream;
+    dc->props = xio3130_downstream_props;
 }
 
 static const TypeInfo xio3130_downstream_info = {

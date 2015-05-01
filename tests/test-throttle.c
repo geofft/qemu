@@ -12,11 +12,14 @@
 
 #include <glib.h>
 #include <math.h>
+#include "block/aio.h"
 #include "qemu/throttle.h"
+#include "qemu/error-report.h"
 
-LeakyBucket    bkt;
-ThrottleConfig cfg;
-ThrottleState  ts;
+static AioContext     *ctx;
+static LeakyBucket    bkt;
+static ThrottleConfig cfg;
+static ThrottleState  ts;
 
 /* useful function */
 static bool double_cmp(double x, double y)
@@ -104,7 +107,8 @@ static void test_init(void)
     memset(&ts, 1, sizeof(ts));
 
     /* init the structure */
-    throttle_init(&ts, QEMU_CLOCK_VIRTUAL, read_timer_cb, write_timer_cb, &ts);
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
 
     /* check initialized fields */
     g_assert(ts.clock_type == QEMU_CLOCK_VIRTUAL);
@@ -126,7 +130,8 @@ static void test_init(void)
 static void test_destroy(void)
 {
     int i;
-    throttle_init(&ts, QEMU_CLOCK_VIRTUAL, read_timer_cb, write_timer_cb, &ts);
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
     throttle_destroy(&ts);
     for (i = 0; i < 2; i++) {
         g_assert(!ts.timers[i]);
@@ -165,7 +170,8 @@ static void test_config_functions(void)
 
     orig_cfg.op_size = 1;
 
-    throttle_init(&ts, QEMU_CLOCK_VIRTUAL, read_timer_cb, write_timer_cb, &ts);
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
     /* structure reset by throttle_init previous_leak should be null */
     g_assert(!ts.previous_leak);
     throttle_config(&ts, &orig_cfg);
@@ -324,9 +330,33 @@ static void test_have_timer(void)
     g_assert(!throttle_have_timer(&ts));
 
     /* init the structure */
-    throttle_init(&ts, QEMU_CLOCK_VIRTUAL, read_timer_cb, write_timer_cb, &ts);
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
 
     /* timer set by init should return true */
+    g_assert(throttle_have_timer(&ts));
+
+    throttle_destroy(&ts);
+}
+
+static void test_detach_attach(void)
+{
+    /* zero the structure */
+    memset(&ts, 0, sizeof(ts));
+
+    /* init the structure */
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
+
+    /* timer set by init should return true */
+    g_assert(throttle_have_timer(&ts));
+
+    /* timer should no longer exist after detaching */
+    throttle_detach_aio_context(&ts);
+    g_assert(!throttle_have_timer(&ts));
+
+    /* timer should exist again after attaching */
+    throttle_attach_aio_context(&ts, ctx);
     g_assert(throttle_have_timer(&ts));
 
     throttle_destroy(&ts);
@@ -357,7 +387,8 @@ static bool do_test_accounting(bool is_ops, /* are we testing bps or ops */
 
     cfg.op_size = op_size;
 
-    throttle_init(&ts, QEMU_CLOCK_VIRTUAL, read_timer_cb, write_timer_cb, &ts);
+    throttle_init(&ts, ctx, QEMU_CLOCK_VIRTUAL,
+                  read_timer_cb, write_timer_cb, &ts);
     throttle_config(&ts, &cfg);
 
     /* account a read */
@@ -461,7 +492,22 @@ static void test_accounting(void)
 
 int main(int argc, char **argv)
 {
+    GSource *src;
+    Error *local_error = NULL;
+
     init_clocks();
+
+    ctx = aio_context_new(&local_error);
+    if (!ctx) {
+        error_report("Failed to create AIO Context: '%s'",
+                     error_get_pretty(local_error));
+        error_free(local_error);
+        exit(1);
+    }
+    src = aio_get_g_source(ctx);
+    g_source_attach(src, NULL);
+    g_source_unref(src);
+
     do {} while (g_main_context_iteration(NULL, false));
 
     /* tests in the same order as the header function declarations */
@@ -471,6 +517,7 @@ int main(int argc, char **argv)
     g_test_add_func("/throttle/init",               test_init);
     g_test_add_func("/throttle/destroy",            test_destroy);
     g_test_add_func("/throttle/have_timer",         test_have_timer);
+    g_test_add_func("/throttle/detach_attach",      test_detach_attach);
     g_test_add_func("/throttle/config/enabled",     test_enabled);
     g_test_add_func("/throttle/config/conflicting", test_conflicting_config);
     g_test_add_func("/throttle/config/is_valid",    test_is_valid);

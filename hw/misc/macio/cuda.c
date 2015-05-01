@@ -123,13 +123,22 @@ static void cuda_update_irq(CUDAState *s)
     }
 }
 
+static uint64_t get_tb(uint64_t freq)
+{
+    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                    freq, get_ticks_per_sec());
+}
+
 static unsigned int get_counter(CUDATimer *s)
 {
     int64_t d;
     unsigned int counter;
+    uint64_t tb_diff;
 
-    d = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->load_time,
-                 CUDA_TIMER_FREQ, get_ticks_per_sec());
+    /* Reverse of the tb calculation algorithm that Mac OS X uses on bootup. */
+    tb_diff = get_tb(s->frequency) - s->load_time;
+    d = (tb_diff * 0xBF401675E5DULL) / (s->frequency << 24);
+
     if (s->index == 0) {
         /* the timer goes down from latch to -1 (period of latch + 2) */
         if (d <= (s->counter_value + 1)) {
@@ -147,7 +156,7 @@ static unsigned int get_counter(CUDATimer *s)
 static void set_counter(CUDAState *s, CUDATimer *ti, unsigned int val)
 {
     CUDA_DPRINTF("T%d.counter=%d\n", 1 + (ti->timer == NULL), val);
-    ti->load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ti->load_time = get_tb(s->frequency);
     ti->counter_value = val;
     cuda_timer_update(s, ti, ti->load_time);
 }
@@ -617,23 +626,21 @@ static const VMStateDescription vmstate_cuda_timer = {
     .name = "cuda_timer",
     .version_id = 0,
     .minimum_version_id = 0,
-    .minimum_version_id_old = 0,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT16(latch, CUDATimer),
         VMSTATE_UINT16(counter_value, CUDATimer),
         VMSTATE_INT64(load_time, CUDATimer),
         VMSTATE_INT64(next_irq_time, CUDATimer),
-        VMSTATE_TIMER_TEST(timer, CUDATimer, cuda_timer_exist),
+        VMSTATE_TIMER_PTR_TEST(timer, CUDATimer, cuda_timer_exist),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const VMStateDescription vmstate_cuda = {
     .name = "cuda",
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8(a, CUDAState),
         VMSTATE_UINT8(b, CUDAState),
         VMSTATE_UINT8(dira, CUDAState),
@@ -653,6 +660,7 @@ static const VMStateDescription vmstate_cuda = {
         VMSTATE_UINT32(tick_offset, CUDAState),
         VMSTATE_STRUCT_ARRAY(timers, CUDAState, 2, 1,
                              vmstate_cuda_timer, CUDATimer),
+        VMSTATE_TIMER_PTR(adb_poll_timer, CUDAState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -690,6 +698,8 @@ static void cuda_realizefn(DeviceState *dev, Error **errp)
     struct tm tm;
 
     s->timers[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cuda_timer1, s);
+    s->timers[0].frequency = s->frequency;
+    s->timers[1].frequency = s->frequency;
 
     qemu_get_timedate(&tm, 0);
     s->tick_offset = (uint32_t)mktimegm(&tm) + RTC_OFFSET;
@@ -715,6 +725,11 @@ static void cuda_initfn(Object *obj)
                         DEVICE(obj), "adb.0");
 }
 
+static Property cuda_properties[] = {
+    DEFINE_PROP_UINT64("frequency", CUDAState, frequency, 0),
+    DEFINE_PROP_END_OF_LIST()
+};
+
 static void cuda_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -722,6 +737,7 @@ static void cuda_class_init(ObjectClass *oc, void *data)
     dc->realize = cuda_realizefn;
     dc->reset = cuda_reset;
     dc->vmsd = &vmstate_cuda;
+    dc->props = cuda_properties;
 }
 
 static const TypeInfo cuda_type_info = {

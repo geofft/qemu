@@ -25,6 +25,7 @@
 
 #include "hw/ide/internal.h"
 #include "hw/scsi/scsi.h"
+#include "sysemu/block-backend.h"
 
 static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret);
 
@@ -110,14 +111,16 @@ static int cd_read_sector(IDEState *s, int lba, uint8_t *buf, int sector_size)
 
     switch(sector_size) {
     case 2048:
-        bdrv_acct_start(s->bs, &s->acct, 4 * BDRV_SECTOR_SIZE, BDRV_ACCT_READ);
-        ret = bdrv_read(s->bs, (int64_t)lba << 2, buf, 4);
-        bdrv_acct_done(s->bs, &s->acct);
+        block_acct_start(blk_get_stats(s->blk), &s->acct,
+                         4 * BDRV_SECTOR_SIZE, BLOCK_ACCT_READ);
+        ret = blk_read(s->blk, (int64_t)lba << 2, buf, 4);
+        block_acct_done(blk_get_stats(s->blk), &s->acct);
         break;
     case 2352:
-        bdrv_acct_start(s->bs, &s->acct, 4 * BDRV_SECTOR_SIZE, BDRV_ACCT_READ);
-        ret = bdrv_read(s->bs, (int64_t)lba << 2, buf + 16, 4);
-        bdrv_acct_done(s->bs, &s->acct);
+        block_acct_start(blk_get_stats(s->blk), &s->acct,
+                         4 * BDRV_SECTOR_SIZE, BLOCK_ACCT_READ);
+        ret = blk_read(s->blk, (int64_t)lba << 2, buf + 16, 4);
+        block_acct_done(blk_get_stats(s->blk), &s->acct);
         if (ret < 0)
             return ret;
         cd_data_to_raw(buf, lba);
@@ -134,6 +137,7 @@ void ide_atapi_cmd_ok(IDEState *s)
     s->error = 0;
     s->status = READY_STAT | SEEK_STAT;
     s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
+    ide_transfer_stop(s);
     ide_set_irq(s->bus);
 }
 
@@ -147,6 +151,7 @@ void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
     s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
     s->sense_key = sense_key;
     s->asc = asc;
+    ide_transfer_stop(s);
     ide_set_irq(s->bus);
 }
 
@@ -174,9 +179,7 @@ void ide_atapi_cmd_reply_end(IDEState *s)
 #endif
     if (s->packet_transfer_size <= 0) {
         /* end of transfer */
-        ide_transfer_stop(s);
-        s->status = READY_STAT | SEEK_STAT;
-        s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
+        ide_atapi_cmd_ok(s);
         ide_set_irq(s->bus);
 #ifdef DEBUG_IDE_ATAPI
         printf("status=0x%x\n", s->status);
@@ -186,7 +189,6 @@ void ide_atapi_cmd_reply_end(IDEState *s)
         if (s->lba != -1 && s->io_buffer_index >= s->cd_sector_size) {
             ret = cd_read_sector(s, s->lba, s->io_buffer, s->cd_sector_size);
             if (ret < 0) {
-                ide_transfer_stop(s);
                 ide_atapi_io_error(s, ret);
                 return;
             }
@@ -250,15 +252,15 @@ static void ide_atapi_cmd_reply(IDEState *s, int size, int max_size)
     s->packet_transfer_size = size;
     s->io_buffer_size = size;    /* dma: send the reply data as one chunk */
     s->elementary_transfer_size = 0;
-    s->io_buffer_index = 0;
 
     if (s->atapi_dma) {
-        bdrv_acct_start(s->bs, &s->acct, size, BDRV_ACCT_READ);
+        block_acct_start(blk_get_stats(s->blk), &s->acct, size,
+                         BLOCK_ACCT_READ);
         s->status = READY_STAT | SEEK_STAT | DRQ_STAT;
-        s->bus->dma->ops->start_dma(s->bus->dma, s,
-                                   ide_atapi_cmd_read_dma_cb);
+        ide_start_dma(s, ide_atapi_cmd_read_dma_cb);
     } else {
         s->status = READY_STAT | SEEK_STAT;
+        s->io_buffer_index = 0;
         ide_atapi_cmd_reply_end(s);
     }
 }
@@ -349,15 +351,14 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
     s->bus->dma->iov.iov_len = n * 4 * 512;
     qemu_iovec_init_external(&s->bus->dma->qiov, &s->bus->dma->iov, 1);
 
-    s->bus->dma->aiocb = bdrv_aio_readv(s->bs, (int64_t)s->lba << 2,
+    s->bus->dma->aiocb = blk_aio_readv(s->blk, (int64_t)s->lba << 2,
                                        &s->bus->dma->qiov, n * 4,
                                        ide_atapi_cmd_read_dma_cb, s);
     return;
 
 eot:
-    bdrv_acct_done(s->bs, &s->acct);
-    s->bus->dma->ops->add_status(s->bus->dma, BM_STATUS_INT);
-    ide_set_inactive(s);
+    block_acct_done(blk_get_stats(s->blk), &s->acct);
+    ide_set_inactive(s, false);
 }
 
 /* start a CD-CDROM read command with DMA */
@@ -367,16 +368,15 @@ static void ide_atapi_cmd_read_dma(IDEState *s, int lba, int nb_sectors,
 {
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
-    s->io_buffer_index = 0;
     s->io_buffer_size = 0;
     s->cd_sector_size = sector_size;
 
-    bdrv_acct_start(s->bs, &s->acct, s->packet_transfer_size, BDRV_ACCT_READ);
+    block_acct_start(blk_get_stats(s->blk), &s->acct, s->packet_transfer_size,
+                     BLOCK_ACCT_READ);
 
     /* XXX: check if BUSY_STAT should be set */
     s->status = READY_STAT | SEEK_STAT | DRQ_STAT | BUSY_STAT;
-    s->bus->dma->ops->start_dma(s->bus->dma, s,
-                               ide_atapi_cmd_read_dma_cb);
+    ide_start_dma(s, ide_atapi_cmd_read_dma_cb);
 }
 
 static void ide_atapi_cmd_read(IDEState *s, int lba, int nb_sectors,
@@ -391,6 +391,23 @@ static void ide_atapi_cmd_read(IDEState *s, int lba, int nb_sectors,
     } else {
         ide_atapi_cmd_read_pio(s, lba, nb_sectors, sector_size);
     }
+}
+
+
+/* Called by *_restart_bh when the transfer function points
+ * to ide_atapi_cmd
+ */
+void ide_atapi_dma_restart(IDEState *s)
+{
+    /*
+     * I'm not sure we have enough stored to restart the command
+     * safely, so give the guest an error it should recover from.
+     * I'm assuming most guests will try to recover from something
+     * listed as a medium error on a CD; it seems to work on Linux.
+     * This would be more of a problem if we did any other type of
+     * DMA operation.
+     */
+    ide_atapi_cmd_error(s, MEDIUM_ERROR, ASC_NO_SEEK_COMPLETE);
 }
 
 static inline uint8_t ide_atapi_set_profile(uint8_t *buf, uint8_t *index,
@@ -504,7 +521,7 @@ static unsigned int event_status_media(IDEState *s,
     media_status = 0;
     if (s->tray_open) {
         media_status = MS_TRAY_OPEN;
-    } else if (bdrv_is_inserted(s->bs)) {
+    } else if (blk_is_inserted(s->blk)) {
         media_status = MS_MEDIA_PRESENT;
     }
 
@@ -620,20 +637,107 @@ static void cmd_request_sense(IDEState *s, uint8_t *buf)
 
 static void cmd_inquiry(IDEState *s, uint8_t *buf)
 {
+    uint8_t page_code = buf[2];
     int max_len = buf[4];
 
-    buf[0] = 0x05; /* CD-ROM */
-    buf[1] = 0x80; /* removable */
-    buf[2] = 0x00; /* ISO */
-    buf[3] = 0x21; /* ATAPI-2 (XXX: put ATAPI-4 ?) */
-    buf[4] = 31; /* additional length */
-    buf[5] = 0; /* reserved */
-    buf[6] = 0; /* reserved */
-    buf[7] = 0; /* reserved */
-    padstr8(buf + 8, 8, "QEMU");
-    padstr8(buf + 16, 16, "QEMU DVD-ROM");
-    padstr8(buf + 32, 4, s->version);
-    ide_atapi_cmd_reply(s, 36, max_len);
+    unsigned idx = 0;
+    unsigned size_idx;
+    unsigned preamble_len;
+
+    /* If the EVPD (Enable Vital Product Data) bit is set in byte 1,
+     * we are being asked for a specific page of info indicated by byte 2. */
+    if (buf[1] & 0x01) {
+        preamble_len = 4;
+        size_idx = 3;
+
+        buf[idx++] = 0x05;      /* CD-ROM */
+        buf[idx++] = page_code; /* Page Code */
+        buf[idx++] = 0x00;      /* reserved */
+        idx++;                  /* length (set later) */
+
+        switch (page_code) {
+        case 0x00:
+            /* Supported Pages: List of supported VPD responses. */
+            buf[idx++] = 0x00; /* 0x00: Supported Pages, and: */
+            buf[idx++] = 0x83; /* 0x83: Device Identification. */
+            break;
+
+        case 0x83:
+            /* Device Identification. Each entry is optional, but the entries
+             * included here are modeled after libata's VPD responses.
+             * If the response is given, at least one entry must be present. */
+
+            /* Entry 1: Serial */
+            if (idx + 24 > max_len) {
+                /* Not enough room for even the first entry: */
+                /* 4 byte header + 20 byte string */
+                ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                    ASC_DATA_PHASE_ERROR);
+                return;
+            }
+            buf[idx++] = 0x02; /* Ascii */
+            buf[idx++] = 0x00; /* Vendor Specific */
+            buf[idx++] = 0x00;
+            buf[idx++] = 20;   /* Remaining length */
+            padstr8(buf + idx, 20, s->drive_serial_str);
+            idx += 20;
+
+            /* Entry 2: Drive Model and Serial */
+            if (idx + 72 > max_len) {
+                /* 4 (header) + 8 (vendor) + 60 (model & serial) */
+                goto out;
+            }
+            buf[idx++] = 0x02; /* Ascii */
+            buf[idx++] = 0x01; /* T10 Vendor */
+            buf[idx++] = 0x00;
+            buf[idx++] = 68;
+            padstr8(buf + idx, 8, "ATA"); /* Generic T10 vendor */
+            idx += 8;
+            padstr8(buf + idx, 40, s->drive_model_str);
+            idx += 40;
+            padstr8(buf + idx, 20, s->drive_serial_str);
+            idx += 20;
+
+            /* Entry 3: WWN */
+            if (s->wwn && (idx + 12 <= max_len)) {
+                /* 4 byte header + 8 byte wwn */
+                buf[idx++] = 0x01; /* Binary */
+                buf[idx++] = 0x03; /* NAA */
+                buf[idx++] = 0x00;
+                buf[idx++] = 0x08;
+                stq_be_p(&buf[idx], s->wwn);
+                idx += 8;
+            }
+            break;
+
+        default:
+            /* SPC-3, revision 23 sec. 6.4 */
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                ASC_INV_FIELD_IN_CMD_PACKET);
+            return;
+        }
+    } else {
+        preamble_len = 5;
+        size_idx = 4;
+
+        buf[0] = 0x05; /* CD-ROM */
+        buf[1] = 0x80; /* removable */
+        buf[2] = 0x00; /* ISO */
+        buf[3] = 0x21; /* ATAPI-2 (XXX: put ATAPI-4 ?) */
+        /* buf[size_idx] set below. */
+        buf[5] = 0;    /* reserved */
+        buf[6] = 0;    /* reserved */
+        buf[7] = 0;    /* reserved */
+        padstr8(buf + 8, 8, "QEMU");
+        padstr8(buf + 16, 16, "QEMU DVD-ROM");
+        padstr8(buf + 32, 4, s->version);
+        idx = 36;
+    }
+
+ out:
+    buf[size_idx] = idx - preamble_len;
+    ide_atapi_cmd_reply(s, idx, max_len);
+    return;
 }
 
 static void cmd_get_configuration(IDEState *s, uint8_t *buf)
@@ -800,7 +904,7 @@ static void cmd_test_unit_ready(IDEState *s, uint8_t *buf)
 static void cmd_prevent_allow_medium_removal(IDEState *s, uint8_t* buf)
 {
     s->tray_locked = buf[4] & 1;
-    bdrv_lock_medium(s->bs, buf[4] & 1);
+    blk_lock_medium(s->blk, buf[4] & 1);
     ide_atapi_cmd_ok(s);
 }
 
@@ -884,14 +988,14 @@ static void cmd_start_stop_unit(IDEState *s, uint8_t* buf)
 
     if (loej) {
         if (!start && !s->tray_open && s->tray_locked) {
-            sense = bdrv_is_inserted(s->bs)
+            sense = blk_is_inserted(s->blk)
                 ? NOT_READY : ILLEGAL_REQUEST;
             ide_atapi_cmd_error(s, sense, ASC_MEDIA_REMOVAL_PREVENTED);
             return;
         }
 
         if (s->tray_open != !start) {
-            bdrv_eject(s->bs, !start);
+            blk_eject(s->blk, !start);
             s->tray_open = !start;
         }
     }
@@ -1125,7 +1229,7 @@ void ide_atapi_cmd(IDEState *s)
      * states rely on this behavior.
      */
     if (!(atapi_cmd_table[s->io_buffer[0]].flags & ALLOW_UA) &&
-        !s->tray_open && bdrv_is_inserted(s->bs) && s->cdrom_changed) {
+        !s->tray_open && blk_is_inserted(s->blk) && s->cdrom_changed) {
 
         if (s->cdrom_changed == 1) {
             ide_atapi_cmd_error(s, NOT_READY, ASC_MEDIUM_NOT_PRESENT);
@@ -1140,7 +1244,7 @@ void ide_atapi_cmd(IDEState *s)
 
     /* Report a Not Ready condition if appropriate for the command */
     if ((atapi_cmd_table[s->io_buffer[0]].flags & CHECK_READY) &&
-        (!media_present(s) || !bdrv_is_inserted(s->bs)))
+        (!media_present(s) || !blk_is_inserted(s->blk)))
     {
         ide_atapi_cmd_error(s, NOT_READY, ASC_MEDIUM_NOT_PRESENT);
         return;

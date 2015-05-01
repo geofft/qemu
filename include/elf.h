@@ -92,6 +92,8 @@ typedef int64_t  Elf64_Sxword;
 
 #define EM_SPARCV9     43	/* SPARC v9 64-bit */
 
+#define EM_TRICORE      44      /* Infineon TriCore */
+
 #define EM_IA_64	50	/* HP/Intel IA-64 */
 
 #define EM_X86_64	62	/* AMD x86-64 */
@@ -254,6 +256,7 @@ typedef int64_t  Elf64_Sxword;
 #define AT_SECURE	23	/* boolean, was exec suid-like? */
 #define AT_BASE_PLATFORM 24	/* string identifying real platforms */
 #define AT_RANDOM	25	/* address of 16 random bytes */
+#define AT_HWCAP2       26      /* extension of AT_HWCAP */
 #define AT_EXECFN	31	/* filename of the executable */
 #define AT_SYSINFO	32	/* address of kernel entry point */
 #define AT_SYSINFO_EHDR	33	/* address of kernel vdso */
@@ -470,14 +473,35 @@ typedef struct {
 #define PPC_FEATURE_TRUE_LE             0x00000002
 #define PPC_FEATURE_PPC_LE              0x00000001
 
-/* Bits present in AT_HWCAP, primarily for Sparc32.  */
+/* Bits present in AT_HWCAP for Sparc.  */
 
-#define HWCAP_SPARC_FLUSH       1    /* CPU supports flush instruction. */
-#define HWCAP_SPARC_STBAR       2
-#define HWCAP_SPARC_SWAP        4
-#define HWCAP_SPARC_MULDIV      8
-#define HWCAP_SPARC_V9		16
-#define HWCAP_SPARC_ULTRA3	32
+#define HWCAP_SPARC_FLUSH               0x00000001
+#define HWCAP_SPARC_STBAR               0x00000002
+#define HWCAP_SPARC_SWAP                0x00000004
+#define HWCAP_SPARC_MULDIV              0x00000008
+#define HWCAP_SPARC_V9                  0x00000010
+#define HWCAP_SPARC_ULTRA3              0x00000020
+#define HWCAP_SPARC_BLKINIT             0x00000040
+#define HWCAP_SPARC_N2                  0x00000080
+#define HWCAP_SPARC_MUL32               0x00000100
+#define HWCAP_SPARC_DIV32               0x00000200
+#define HWCAP_SPARC_FSMULD              0x00000400
+#define HWCAP_SPARC_V8PLUS              0x00000800
+#define HWCAP_SPARC_POPC                0x00001000
+#define HWCAP_SPARC_VIS                 0x00002000
+#define HWCAP_SPARC_VIS2                0x00004000
+#define HWCAP_SPARC_ASI_BLK_INIT        0x00008000
+#define HWCAP_SPARC_FMAF                0x00010000
+#define HWCAP_SPARC_VIS3                0x00020000
+#define HWCAP_SPARC_HPC                 0x00040000
+#define HWCAP_SPARC_RANDOM              0x00080000
+#define HWCAP_SPARC_TRANS               0x00100000
+#define HWCAP_SPARC_FJFMAU              0x00200000
+#define HWCAP_SPARC_IMA                 0x00400000
+#define HWCAP_SPARC_ASI_CACHE_SPARING   0x00800000
+#define HWCAP_SPARC_PAUSE               0x01000000
+#define HWCAP_SPARC_CBCOND              0x02000000
+#define HWCAP_SPARC_CRYPTO              0x04000000
 
 /* Bits present in AT_HWCAP for s390.  */
 
@@ -559,6 +583,11 @@ typedef struct {
 
 #define SHF_ALPHA_GPREL		0x10000000
 
+
+/* PowerPC specific definitions.  */
+
+/* Processor specific flags for the ELF header e_flags field.  */
+#define EF_PPC64_ABI           0x3
 
 /* PowerPC relocations defined by the ABIs */
 #define R_PPC_NONE		0
@@ -1479,6 +1508,7 @@ struct elf32_fdpic_loadmap {
 #define elf_shdr	elf32_shdr
 #define elf_sym		elf32_sym
 #define elf_addr_t	Elf32_Off
+#define elf_rela  elf32_rela
 
 #ifdef ELF_USES_RELOCA
 # define ELF_RELOC      Elf32_Rela
@@ -1494,6 +1524,7 @@ struct elf32_fdpic_loadmap {
 #define elf_shdr	elf64_shdr
 #define elf_sym		elf64_sym
 #define elf_addr_t	Elf64_Off
+#define elf_rela  elf64_rela
 
 #ifdef ELF_USES_RELOCA
 # define ELF_RELOC      Elf64_Rela

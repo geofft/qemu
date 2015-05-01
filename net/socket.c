@@ -352,7 +352,7 @@ static NetSocketState *net_socket_fd_init_dgram(NetClientState *peer,
 {
     struct sockaddr_in saddr;
     int newfd;
-    socklen_t saddr_len;
+    socklen_t saddr_len = sizeof(saddr);
     NetClientState *nc;
     NetSocketState *s;
 
@@ -389,11 +389,6 @@ static NetSocketState *net_socket_fd_init_dgram(NetClientState *peer,
 
     nc = qemu_new_net_client(&net_dgram_socket_info, peer, model, name);
 
-    snprintf(nc->info_str, sizeof(nc->info_str),
-            "socket: fd=%d (%s mcast=%s:%d)",
-            fd, is_connected ? "cloned" : "",
-            inet_ntoa(saddr.sin_addr), ntohs(saddr.sin_port));
-
     s = DO_UPCAST(NetSocketState, nc, nc);
 
     s->fd = fd;
@@ -404,6 +399,12 @@ static NetSocketState *net_socket_fd_init_dgram(NetClientState *peer,
     /* mcast: save bound address as dst */
     if (is_connected) {
         s->dgram_dst = saddr;
+        snprintf(nc->info_str, sizeof(nc->info_str),
+                 "socket: fd=%d (cloned mcast=%s:%d)",
+                 fd, inet_ntoa(saddr.sin_addr), ntohs(saddr.sin_port));
+    } else {
+        snprintf(nc->info_str, sizeof(nc->info_str),
+                 "socket: fd=%d", fd);
     }
 
     return s;
@@ -694,6 +695,7 @@ static int net_socket_udp_init(NetClientState *peer,
 int net_init_socket(const NetClientOptions *opts, const char *name,
                     NetClientState *peer)
 {
+    Error *err = NULL;
     const NetdevSocketOptions *sock;
 
     assert(opts->kind == NET_CLIENT_OPTIONS_KIND_SOCKET);
@@ -714,8 +716,9 @@ int net_init_socket(const NetClientOptions *opts, const char *name,
     if (sock->has_fd) {
         int fd;
 
-        fd = monitor_handle_fd_param(cur_mon, sock->fd);
+        fd = monitor_fd_param(cur_mon, sock->fd, &err);
         if (fd == -1) {
+            error_report_err(err);
             return -1;
         }
         qemu_set_nonblock(fd);

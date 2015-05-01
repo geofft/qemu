@@ -61,6 +61,11 @@ elif [ "$IMGPROTO" = "nbd" ]; then
 elif [ "$IMGPROTO" = "ssh" ]; then
     TEST_IMG_FILE=$TEST_DIR/t.$IMGFMT
     TEST_IMG="ssh://127.0.0.1$TEST_IMG_FILE"
+elif [ "$IMGPROTO" = "nfs" ]; then
+    TEST_DIR="nfs://127.0.0.1/$TEST_DIR"
+    TEST_IMG=$TEST_DIR/t.$IMGFMT
+elif [ "$IMGPROTO" = "archipelago" ]; then
+    TEST_IMG="archipelago:at.$IMGFMT"
 else
     TEST_IMG=$IMGPROTO:$TEST_DIR/t.$IMGFMT
 fi
@@ -144,30 +149,25 @@ _make_test_img()
      else
         $QEMU_IMG create -f $IMGFMT $extra_img_options "$img_name" $image_size 2>&1
      fi
-    ) | \
-        sed -e "s#$IMGPROTO:$TEST_DIR#TEST_DIR#g" \
-            -e "s#$TEST_DIR#TEST_DIR#g" \
-            -e "s#$IMGFMT#IMGFMT#g" \
-            -e "s# encryption=off##g" \
-            -e "s# cluster_size=[0-9]\\+##g" \
-            -e "s# table_size=[0-9]\\+##g" \
-            -e "s# compat='[^']*'##g" \
-            -e "s# compat6=\\(on\\|off\\)##g" \
-            -e "s# static=\\(on\\|off\\)##g" \
-            -e "s# zeroed_grain=\\(on\\|off\\)##g" \
-            -e "s# subformat='[^']*'##g" \
-            -e "s# adapter_type='[^']*'##g" \
-            -e "s# lazy_refcounts=\\(on\\|off\\)##g" \
-            -e "s# block_size=[0-9]\\+##g" \
-            -e "s# block_state_zero=\\(on\\|off\\)##g" \
-            -e "s# log_size=[0-9]\\+##g"
+    ) | _filter_img_create
 
     # Start an NBD server on the image file, which is what we'll be talking to
     if [ $IMGPROTO = "nbd" ]; then
-        eval "$QEMU_NBD -v -t -b 127.0.0.1 -p 10810  $TEST_IMG_FILE &"
+        eval "$QEMU_NBD -v -t -b 127.0.0.1 -p 10810 -f $IMGFMT  $TEST_IMG_FILE &"
         QEMU_NBD_PID=$!
         sleep 1 # FIXME: qemu-nbd needs to be listening before we continue
     fi
+}
+
+_rm_test_img()
+{
+    local img=$1
+    if [ "$IMGFMT" = "vmdk" ]; then
+        # Remove all the extents for vmdk
+        "$QEMU_IMG" info "$img" 2>/dev/null | grep 'filename:' | cut -f 2 -d: \
+            | xargs -I {} rm -f "{}"
+    fi
+    rm -f "$img"
 }
 
 _cleanup_test_img()
@@ -175,13 +175,15 @@ _cleanup_test_img()
     case "$IMGPROTO" in
 
         nbd)
-            kill $QEMU_NBD_PID
+            if [ -n "$QEMU_NBD_PID" ]; then
+                kill $QEMU_NBD_PID
+            fi
             rm -f "$TEST_IMG_FILE"
             ;;
         file)
-            rm -f "$TEST_DIR/t.$IMGFMT"
-            rm -f "$TEST_DIR/t.$IMGFMT.orig"
-            rm -f "$TEST_DIR/t.$IMGFMT.base"
+            _rm_test_img "$TEST_DIR/t.$IMGFMT"
+            _rm_test_img "$TEST_DIR/t.$IMGFMT.orig"
+            _rm_test_img "$TEST_DIR/t.$IMGFMT.base"
             if [ -n "$SAMPLE_IMG_FILE" ]
             then
                 rm -f "$TEST_DIR/$SAMPLE_IMG_FILE"
@@ -189,7 +191,11 @@ _cleanup_test_img()
             ;;
 
         rbd)
-            rbd rm "$TEST_DIR/t.$IMGFMT" > /dev/null
+            rbd --no-progress rm "$TEST_DIR/t.$IMGFMT" > /dev/null
+            ;;
+
+        archipelago)
+            vlmc remove "at.$IMGFMT" > /dev/null
             ;;
 
         sheepdog)
@@ -209,6 +215,13 @@ _check_test_img()
 
 _img_info()
 {
+    if [[ "$1" == "--format-specific" ]]; then
+        local format_specific=1
+        shift
+    else
+        local format_specific=0
+    fi
+
     discard=0
     regex_json_spec_start='^ *"format-specific": \{'
     $QEMU_IMG info "$@" "$TEST_IMG" 2>&1 | \
@@ -218,7 +231,9 @@ _img_info()
             -e "/^disk size:/ D" \
             -e "/actual-size/ D" | \
         while IFS='' read line; do
-            if [[ $line == "Format specific information:" ]]; then
+            if [[ $format_specific == 1 ]]; then
+                discard=0
+            elif [[ $line == "Format specific information:" ]]; then
                 discard=1
             elif [[ $line =~ $regex_json_spec_start ]]; then
                 discard=2
@@ -304,9 +319,9 @@ _do()
         status=1; exit
     fi
 
-    (eval "echo '---' \"$_cmd\"") >>$here/$seq.full
+    (eval "echo '---' \"$_cmd\"") >>"$OUTPUT_DIR/$seq.full"
     (eval "$_cmd") >$tmp._out 2>&1; ret=$?
-    cat $tmp._out >>$here/$seq.full
+    cat $tmp._out >>"$OUTPUT_DIR/$seq.full"
     if [ $# -eq 2 ]; then
         if [ $ret -eq 0 ]; then
             echo "done"
@@ -330,7 +345,7 @@ _do()
 #
 _notrun()
 {
-    echo "$*" >$seq.notrun
+    echo "$*" >"$OUTPUT_DIR/$seq.notrun"
     echo "$seq not run: $*"
     status=0
     exit
@@ -340,7 +355,7 @@ _notrun()
 #
 _fail()
 {
-    echo "$*" | tee -a $here/$seq.full
+    echo "$*" | tee -a "$OUTPUT_DIR/$seq.full"
     echo "(see $seq.full for details)"
     status=1
     exit 1
@@ -350,6 +365,9 @@ _fail()
 #
 _supported_fmt()
 {
+    # "generic" is suitable for most image formats. For some formats it doesn't
+    # work, however (most notably read-only formats), so they can opt out by
+    # setting IMGFMT_GENERIC to false.
     for f; do
         if [ "$f" = "$IMGFMT" -o "$f" = "generic" -a "$IMGFMT_GENERIC" = "true" ]; then
             return
@@ -404,6 +422,17 @@ _default_cache_mode()
         QEMU_IO="$QEMU_IO --cache $1"
         return
     fi
+}
+
+_unsupported_imgopts()
+{
+    for bad_opt
+    do
+        if echo "$IMGOPTS" | grep -q 2>/dev/null "$bad_opt"
+        then
+            _notrun "not suitable for image option: $bad_opt"
+        fi
+    done
 }
 
 # this test requires that a specified command (executable) exists
@@ -461,4 +490,4 @@ _die()
 }
 
 # make sure this script returns success
-/bin/true
+true

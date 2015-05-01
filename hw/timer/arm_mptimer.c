@@ -246,7 +246,7 @@ static const VMStateDescription vmstate_timerblock = {
         VMSTATE_UINT32(control, TimerBlock),
         VMSTATE_UINT32(status, TimerBlock),
         VMSTATE_INT64(tick, TimerBlock),
-        VMSTATE_TIMER(timer, TimerBlock),
+        VMSTATE_TIMER_PTR(timer, TimerBlock),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -274,7 +274,6 @@ static void arm_mptimer_class_init(ObjectClass *klass, void *data)
     dc->realize = arm_mptimer_realize;
     dc->vmsd = &vmstate_arm_mptimer;
     dc->reset = arm_mptimer_reset;
-    dc->no_user = 1;
     dc->props = arm_mptimer_properties;
 }
 

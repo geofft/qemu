@@ -12,7 +12,9 @@
 #ifndef BITOPS_H
 #define BITOPS_H
 
-#include "qemu-common.h"
+#include <stdint.h>
+#include <assert.h>
+
 #include "host-utils.h"
 
 #define BITS_PER_BYTE           CHAR_BIT
@@ -28,7 +30,7 @@
  * @nr: the bit to set
  * @addr: the address to start counting from
  */
-static inline void set_bit(int nr, unsigned long *addr)
+static inline void set_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -41,7 +43,7 @@ static inline void set_bit(int nr, unsigned long *addr)
  * @nr: Bit to clear
  * @addr: Address to start counting from
  */
-static inline void clear_bit(int nr, unsigned long *addr)
+static inline void clear_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -54,7 +56,7 @@ static inline void clear_bit(int nr, unsigned long *addr)
  * @nr: Bit to change
  * @addr: Address to start counting from
  */
-static inline void change_bit(int nr, unsigned long *addr)
+static inline void change_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -67,7 +69,7 @@ static inline void change_bit(int nr, unsigned long *addr)
  * @nr: Bit to set
  * @addr: Address to count from
  */
-static inline int test_and_set_bit(int nr, unsigned long *addr)
+static inline int test_and_set_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -82,7 +84,7 @@ static inline int test_and_set_bit(int nr, unsigned long *addr)
  * @nr: Bit to clear
  * @addr: Address to count from
  */
-static inline int test_and_clear_bit(int nr, unsigned long *addr)
+static inline int test_and_clear_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -97,7 +99,7 @@ static inline int test_and_clear_bit(int nr, unsigned long *addr)
  * @nr: Bit to change
  * @addr: Address to count from
  */
-static inline int test_and_change_bit(int nr, unsigned long *addr)
+static inline int test_and_change_bit(long nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);
         unsigned long *p = addr + BIT_WORD(nr);
@@ -112,7 +114,7 @@ static inline int test_and_change_bit(int nr, unsigned long *addr)
  * @nr: bit number to test
  * @addr: Address to start counting from
  */
-static inline int test_bit(int nr, const unsigned long *addr)
+static inline int test_bit(long nr, const unsigned long *addr)
 {
 	return 1UL & (addr[BIT_WORD(nr)] >> (nr & (BITS_PER_LONG-1)));
 }
@@ -157,7 +159,17 @@ unsigned long find_next_zero_bit(const unsigned long *addr,
 static inline unsigned long find_first_bit(const unsigned long *addr,
                                            unsigned long size)
 {
-    return find_next_bit(addr, size, 0);
+    unsigned long result, tmp;
+
+    for (result = 0; result < size; result += BITS_PER_LONG) {
+        tmp = *addr++;
+        if (tmp) {
+            result += ctzl(tmp);
+            return result < size ? result : size;
+        }
+    }
+    /* Not found */
+    return size;
 }
 
 /**
@@ -342,7 +354,7 @@ static inline int32_t sextract32(uint32_t value, int start, int length)
  * Returns: the sign extended value of the bit field extracted from the
  * input value.
  */
-static inline uint64_t sextract64(uint64_t value, int start, int length)
+static inline int64_t sextract64(uint64_t value, int start, int length)
 {
     assert(start >= 0 && length > 0 && length <= 64 - start);
     /* Note that this implementation relies on right shift of signed

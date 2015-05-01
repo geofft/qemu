@@ -26,6 +26,8 @@
 #include "sysemu/sysemu.h"
 #include "hw/timer/mc146818rtc.h"
 #include "qapi/visitor.h"
+#include "qapi-event.h"
+#include "qmp-commands.h"
 
 #ifdef TARGET_I386
 #include "hw/i386/apic.h"
@@ -84,6 +86,7 @@ typedef struct RTCState {
     Notifier clock_reset_notifier;
     LostTickPolicy lost_tick_policy;
     Notifier suspend_notifier;
+    QLIST_ENTRY(RTCState) link;
 } RTCState;
 
 static void rtc_set_time(RTCState *s);
@@ -185,7 +188,7 @@ static void rtc_periodic_timer(void *opaque)
     if (s->cmos_data[RTC_REG_B] & REG_B_PIE) {
         s->cmos_data[RTC_REG_C] |= REG_C_IRQF;
 #ifdef TARGET_I386
-        if (s->lost_tick_policy == LOST_TICK_SLEW) {
+        if (s->lost_tick_policy == LOST_TICK_POLICY_SLEW) {
             if (s->irq_reinject_on_ack_count >= RTC_REINJECT_ON_ACK_COUNT)
                 s->irq_reinject_on_ack_count = 0;		
             apic_reset_irq_delivered();
@@ -388,7 +391,7 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
     if ((addr & 1) == 0) {
         s->cmos_index = data & 0x7f;
     } else {
-        CMOS_DPRINTF("cmos: write index=0x%02x val=0x%02x\n",
+        CMOS_DPRINTF("cmos: write index=0x%02x val=0x%02" PRIx64 "\n",
                      s->cmos_index, data);
         switch(s->cmos_index) {
         case RTC_SECONDS_ALARM:
@@ -522,6 +525,20 @@ static void rtc_get_time(RTCState *s, struct tm *tm)
         rtc_from_bcd(s, s->cmos_data[RTC_CENTURY]) * 100 - 1900;
 }
 
+static QLIST_HEAD(, RTCState) rtc_devices =
+    QLIST_HEAD_INITIALIZER(rtc_devices);
+
+#ifdef TARGET_I386
+void qmp_rtc_reset_reinjection(Error **errp)
+{
+    RTCState *s;
+
+    QLIST_FOREACH(s, &rtc_devices, link) {
+        s->irq_coalesced = 0;
+    }
+}
+#endif
+
 static void rtc_set_time(RTCState *s)
 {
     struct tm tm;
@@ -530,7 +547,7 @@ static void rtc_set_time(RTCState *s)
     s->base_rtc = mktimegm(&tm);
     s->last_update = qemu_clock_get_ns(rtc_clock);
 
-    rtc_change_mon_event(&tm);
+    qapi_event_send_rtc_change(qemu_timedate_diff(&tm), &error_abort);
 }
 
 static void rtc_set_cmos(RTCState *s, const struct tm *tm)
@@ -708,7 +725,7 @@ static int rtc_post_load(void *opaque, int version_id)
 
 #ifdef TARGET_I386
     if (version_id >= 2) {
-        if (s->lost_tick_policy == LOST_TICK_SLEW) {
+        if (s->lost_tick_policy == LOST_TICK_POLICY_SLEW) {
             rtc_coalesced_timer_update(s);
         }
     }
@@ -716,17 +733,32 @@ static int rtc_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static const VMStateDescription vmstate_rtc_irq_reinject_on_ack_count = {
+    .name = "mc146818rtc/irq_reinject_on_ack_count",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT16(irq_reinject_on_ack_count, RTCState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool rtc_irq_reinject_on_ack_count_needed(void *opaque)
+{
+    RTCState *s = (RTCState *)opaque;
+    return s->irq_reinject_on_ack_count != 0;
+}
+
 static const VMStateDescription vmstate_rtc = {
     .name = "mc146818rtc",
     .version_id = 3,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = rtc_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_BUFFER(cmos_data, RTCState),
         VMSTATE_UINT8(cmos_index, RTCState),
         VMSTATE_UNUSED(7*4),
-        VMSTATE_TIMER(periodic_timer, RTCState),
+        VMSTATE_TIMER_PTR(periodic_timer, RTCState),
         VMSTATE_INT64(next_periodic_time, RTCState),
         VMSTATE_UNUSED(3*8),
         VMSTATE_UINT32_V(irq_coalesced, RTCState, 2),
@@ -734,9 +766,17 @@ static const VMStateDescription vmstate_rtc = {
         VMSTATE_UINT64_V(base_rtc, RTCState, 3),
         VMSTATE_UINT64_V(last_update, RTCState, 3),
         VMSTATE_INT64_V(offset, RTCState, 3),
-        VMSTATE_TIMER_V(update_timer, RTCState, 3),
+        VMSTATE_TIMER_PTR_V(update_timer, RTCState, 3),
         VMSTATE_UINT64_V(next_alarm_time, RTCState, 3),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (VMStateSubsection[]) {
+        {
+            .vmsd = &vmstate_rtc_irq_reinject_on_ack_count,
+            .needed = rtc_irq_reinject_on_ack_count_needed,
+        }, {
+            /* empty */
+        }
     }
 };
 
@@ -749,7 +789,7 @@ static void rtc_notify_clock_reset(Notifier *notifier, void *data)
     periodic_timer_update(s, now);
     check_update_timer(s);
 #ifdef TARGET_I386
-    if (s->lost_tick_policy == LOST_TICK_SLEW) {
+    if (s->lost_tick_policy == LOST_TICK_POLICY_SLEW) {
         rtc_coalesced_timer_update(s);
     }
 #endif
@@ -774,8 +814,9 @@ static void rtc_reset(void *opaque)
     qemu_irq_lower(s->irq);
 
 #ifdef TARGET_I386
-    if (s->lost_tick_policy == LOST_TICK_SLEW) {
+    if (s->lost_tick_policy == LOST_TICK_POLICY_SLEW) {
         s->irq_coalesced = 0;
+        s->irq_reinject_on_ack_count = 0;		
     }
 #endif
 }
@@ -790,22 +831,12 @@ static const MemoryRegionOps cmos_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static void rtc_get_date(Object *obj, Visitor *v, void *opaque,
-                         const char *name, Error **errp)
+static void rtc_get_date(Object *obj, struct tm *current_tm, Error **errp)
 {
     RTCState *s = MC146818_RTC(obj);
-    struct tm current_tm;
 
     rtc_update_time(s);
-    rtc_get_time(s, &current_tm);
-    visit_start_struct(v, NULL, "struct tm", name, 0, errp);
-    visit_type_int32(v, &current_tm.tm_year, "tm_year", errp);
-    visit_type_int32(v, &current_tm.tm_mon, "tm_mon", errp);
-    visit_type_int32(v, &current_tm.tm_mday, "tm_mday", errp);
-    visit_type_int32(v, &current_tm.tm_hour, "tm_hour", errp);
-    visit_type_int32(v, &current_tm.tm_min, "tm_min", errp);
-    visit_type_int32(v, &current_tm.tm_sec, "tm_sec", errp);
-    visit_end_struct(v, errp);
+    rtc_get_time(s, current_tm);
 }
 
 static void rtc_realizefn(DeviceState *dev, Error **errp)
@@ -835,11 +866,11 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
 
 #ifdef TARGET_I386
     switch (s->lost_tick_policy) {
-    case LOST_TICK_SLEW:
+    case LOST_TICK_POLICY_SLEW:
         s->coalesced_timer =
             timer_new_ns(rtc_clock, rtc_coalesced_timer, s);
         break;
-    case LOST_TICK_DISCARD:
+    case LOST_TICK_POLICY_DISCARD:
         break;
     default:
         error_setg(errp, "Invalid lost tick policy.");
@@ -852,7 +883,7 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
     check_update_timer(s);
 
     s->clock_reset_notifier.notify = rtc_notify_clock_reset;
-    qemu_clock_register_reset_notifier(QEMU_CLOCK_REALTIME,
+    qemu_clock_register_reset_notifier(rtc_clock,
                                        &s->clock_reset_notifier);
 
     s->suspend_notifier.notify = rtc_notify_suspend;
@@ -864,8 +895,10 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
     qdev_set_legacy_instance_id(dev, base, 3);
     qemu_register_reset(rtc_reset, s);
 
-    object_property_add(OBJECT(s), "date", "struct tm",
-                        rtc_get_date, NULL, NULL, s, NULL);
+    object_property_add_tm(OBJECT(s), "date", rtc_get_date, NULL);
+
+    object_property_add_alias(qdev_get_machine(), "rtc-time",
+                              OBJECT(s), "date", NULL);
 }
 
 ISADevice *rtc_init(ISABus *bus, int base_year, qemu_irq intercept_irq)
@@ -884,13 +917,15 @@ ISADevice *rtc_init(ISABus *bus, int base_year, qemu_irq intercept_irq)
     } else {
         isa_init_irq(isadev, &s->irq, RTC_ISA_IRQ);
     }
+    QLIST_INSERT_HEAD(&rtc_devices, s, link);
+
     return isadev;
 }
 
 static Property mc146818rtc_properties[] = {
     DEFINE_PROP_INT32("base_year", RTCState, base_year, 1980),
     DEFINE_PROP_LOSTTICKPOLICY("lost_tick_policy", RTCState,
-                               lost_tick_policy, LOST_TICK_DISCARD),
+                               lost_tick_policy, LOST_TICK_POLICY_DISCARD),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -899,9 +934,15 @@ static void rtc_class_initfn(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = rtc_realizefn;
-    dc->no_user = 1;
     dc->vmsd = &vmstate_rtc;
     dc->props = mc146818rtc_properties;
+    /* Reason: needs to be wired up by rtc_init() */
+    dc->cannot_instantiate_with_device_add_yet = true;
+}
+
+static void rtc_finalize(Object *obj)
+{
+    object_property_del(qdev_get_machine(), "rtc", NULL);
 }
 
 static const TypeInfo mc146818rtc_info = {
@@ -909,6 +950,7 @@ static const TypeInfo mc146818rtc_info = {
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(RTCState),
     .class_init    = rtc_class_initfn,
+    .instance_finalize = rtc_finalize,
 };
 
 static void mc146818rtc_register_types(void)

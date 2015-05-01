@@ -25,9 +25,6 @@ void qemu_mutex_lock(QemuMutex *mutex);
 int qemu_mutex_trylock(QemuMutex *mutex);
 void qemu_mutex_unlock(QemuMutex *mutex);
 
-#define rcu_read_lock() do { } while (0)
-#define rcu_read_unlock() do { } while (0)
-
 void qemu_cond_init(QemuCond *cond);
 void qemu_cond_destroy(QemuCond *cond);
 
@@ -52,12 +49,17 @@ void qemu_event_reset(QemuEvent *ev);
 void qemu_event_wait(QemuEvent *ev);
 void qemu_event_destroy(QemuEvent *ev);
 
-void qemu_thread_create(QemuThread *thread,
+void qemu_thread_create(QemuThread *thread, const char *name,
                         void *(*start_routine)(void *),
                         void *arg, int mode);
 void *qemu_thread_join(QemuThread *thread);
 void qemu_thread_get_self(QemuThread *thread);
 bool qemu_thread_is_self(QemuThread *thread);
 void qemu_thread_exit(void *retval);
+void qemu_thread_naming(bool enable);
+
+struct Notifier;
+void qemu_thread_atexit_add(struct Notifier *notifier);
+void qemu_thread_atexit_remove(struct Notifier *notifier);
 
 #endif

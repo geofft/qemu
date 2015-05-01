@@ -18,11 +18,10 @@
 #include "hw/char/serial.h"
 #include "qemu/timer.h"
 #include "hw/ptimer.h"
-#include "block/block.h"
 #include "hw/block/flash.h"
 #include "ui/console.h"
 #include "hw/i2c/i2c.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
 #include "ui/pixel_ops.h"
 
@@ -92,8 +91,6 @@
 #define MP_ETH_CRDP3            0x4AC
 #define MP_ETH_CTDP0            0x4E0
 #define MP_ETH_CTDP1            0x4E4
-#define MP_ETH_CTDP2            0x4E8
-#define MP_ETH_CTDP3            0x4EC
 
 /* MII PHY access */
 #define MP_ETH_SMIR_DATA        0x0000FFFF
@@ -112,10 +109,10 @@
 #define MP_PHY_88E3015          0x01410E20
 
 /* TX descriptor status */
-#define MP_ETH_TX_OWN           (1 << 31)
+#define MP_ETH_TX_OWN           (1U << 31)
 
 /* RX descriptor status */
-#define MP_ETH_RX_OWN           (1 << 31)
+#define MP_ETH_RX_OWN           (1U << 31)
 
 /* Interrupt cause/mask bits */
 #define MP_ETH_IRQ_RX_BIT       0
@@ -308,7 +305,7 @@ static uint64_t mv88w8618_eth_read(void *opaque, hwaddr offset,
     case MP_ETH_CRDP0 ... MP_ETH_CRDP3:
         return s->rx_queue[(offset - MP_ETH_CRDP0)/4];
 
-    case MP_ETH_CTDP0 ... MP_ETH_CTDP3:
+    case MP_ETH_CTDP0 ... MP_ETH_CTDP1:
         return s->tx_queue[(offset - MP_ETH_CTDP0)/4];
 
     default:
@@ -362,7 +359,7 @@ static void mv88w8618_eth_write(void *opaque, hwaddr offset,
             s->cur_rx[(offset - MP_ETH_CRDP0)/4] = value;
         break;
 
-    case MP_ETH_CTDP0 ... MP_ETH_CTDP3:
+    case MP_ETH_CTDP0 ... MP_ETH_CTDP1:
         s->tx_queue[(offset - MP_ETH_CTDP0)/4] = value;
         break;
     }
@@ -407,7 +404,6 @@ static const VMStateDescription mv88w8618_eth_vmsd = {
     .name = "mv88w8618_eth",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(smir, mv88w8618_eth_state),
         VMSTATE_UINT32(icr, mv88w8618_eth_state),
@@ -632,7 +628,7 @@ static int musicpal_lcd_init(SysBusDevice *sbd)
                           "musicpal-lcd", MP_LCD_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
 
-    s->con = graphic_console_init(dev, &musicpal_gfx_ops, s);
+    s->con = graphic_console_init(dev, 0, &musicpal_gfx_ops, s);
     qemu_console_resize(s->con, 128*3, 64*3);
 
     qdev_init_gpio_in(dev, musicpal_lcd_gpio_brightness_in, 3);
@@ -644,7 +640,6 @@ static const VMStateDescription musicpal_lcd_vmsd = {
     .name = "musicpal_lcd",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(brightness, musicpal_lcd_state),
         VMSTATE_UINT32(mode, musicpal_lcd_state),
@@ -771,7 +766,6 @@ static const VMStateDescription mv88w8618_pic_vmsd = {
     .name = "mv88w8618_pic",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(level, mv88w8618_pic_state),
         VMSTATE_UINT32(enabled, mv88w8618_pic_state),
@@ -942,7 +936,6 @@ static const VMStateDescription mv88w8618_timer_vmsd = {
     .name = "timer",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_PTIMER(ptimer, mv88w8618_timer_state),
         VMSTATE_UINT32(limit, mv88w8618_timer_state),
@@ -954,7 +947,6 @@ static const VMStateDescription mv88w8618_pit_vmsd = {
     .name = "mv88w8618_pit",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(timer, mv88w8618_pit_state, 4, 1,
                              mv88w8618_timer_vmsd, mv88w8618_timer_state),
@@ -1043,7 +1035,6 @@ static const VMStateDescription mv88w8618_flashcfg_vmsd = {
     .name = "mv88w8618_flashcfg",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(cfgr0, mv88w8618_flashcfg_state),
         VMSTATE_END_OF_LIST()
@@ -1383,7 +1374,6 @@ static const VMStateDescription musicpal_gpio_vmsd = {
     .name = "musicpal_gpio",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(lcd_brightness, musicpal_gpio_state),
         VMSTATE_UINT32(out_state, musicpal_gpio_state),
@@ -1550,7 +1540,6 @@ static const VMStateDescription musicpal_key_vmsd = {
     .name = "musicpal_key",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(kbd_extended, musicpal_key_state),
         VMSTATE_UINT32(pressed_keys, musicpal_key_state),
@@ -1579,12 +1568,12 @@ static struct arm_boot_info musicpal_binfo = {
     .board_id = 0x20e,
 };
 
-static void musicpal_init(QEMUMachineInitArgs *args)
+static void musicpal_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     ARMCPU *cpu;
     qemu_irq pic[32];
     DeviceState *dev;
@@ -1593,7 +1582,7 @@ static void musicpal_init(QEMUMachineInitArgs *args)
     DeviceState *key_dev;
     DeviceState *wm8750_dev;
     SysBusDevice *s;
-    i2c_bus *i2c;
+    I2CBus *i2c;
     int i;
     unsigned long flash_size;
     DriveInfo *dinfo;
@@ -1611,11 +1600,12 @@ static void musicpal_init(QEMUMachineInitArgs *args)
     }
 
     /* For now we use a fixed - the original - RAM size */
-    memory_region_init_ram(ram, NULL, "musicpal.ram", MP_RAM_DEFAULT_SIZE);
-    vmstate_register_ram_global(ram);
+    memory_region_allocate_system_memory(ram, NULL, "musicpal.ram",
+                                         MP_RAM_DEFAULT_SIZE);
     memory_region_add_subregion(address_space_mem, 0, ram);
 
-    memory_region_init_ram(sram, NULL, "musicpal.sram", MP_SRAM_SIZE);
+    memory_region_init_ram(sram, NULL, "musicpal.sram", MP_SRAM_SIZE,
+                           &error_abort);
     vmstate_register_ram_global(sram);
     memory_region_add_subregion(address_space_mem, MP_SRAM_BASE, sram);
 
@@ -1640,7 +1630,9 @@ static void musicpal_init(QEMUMachineInitArgs *args)
     /* Register flash */
     dinfo = drive_get(IF_PFLASH, 0, 0);
     if (dinfo) {
-        flash_size = bdrv_getlength(dinfo->bdrv);
+        BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
+
+        flash_size = blk_getlength(blk);
         if (flash_size != 8*1024*1024 && flash_size != 16*1024*1024 &&
             flash_size != 32*1024*1024) {
             fprintf(stderr, "Invalid flash image size\n");
@@ -1655,16 +1647,14 @@ static void musicpal_init(QEMUMachineInitArgs *args)
 #ifdef TARGET_WORDS_BIGENDIAN
         pflash_cfi02_register(0x100000000ULL-MP_FLASH_SIZE_MAX, NULL,
                               "musicpal.flash", flash_size,
-                              dinfo->bdrv, 0x10000,
-                              (flash_size + 0xffff) >> 16,
+                              blk, 0x10000, (flash_size + 0xffff) >> 16,
                               MP_FLASH_SIZE_MAX / flash_size,
                               2, 0x00BF, 0x236D, 0x0000, 0x0000,
                               0x5555, 0x2AAA, 1);
 #else
         pflash_cfi02_register(0x100000000ULL-MP_FLASH_SIZE_MAX, NULL,
                               "musicpal.flash", flash_size,
-                              dinfo->bdrv, 0x10000,
-                              (flash_size + 0xffff) >> 16,
+                              blk, 0x10000, (flash_size + 0xffff) >> 16,
                               MP_FLASH_SIZE_MAX / flash_size,
                               2, 0x00BF, 0x236D, 0x0000, 0x0000,
                               0x5555, 0x2AAA, 0);
@@ -1687,7 +1677,7 @@ static void musicpal_init(QEMUMachineInitArgs *args)
     dev = sysbus_create_simple(TYPE_MUSICPAL_GPIO, MP_GPIO_BASE,
                                pic[MP_GPIO_IRQ]);
     i2c_dev = sysbus_create_simple("gpio_i2c", -1, NULL);
-    i2c = (i2c_bus *)qdev_get_child_bus(i2c_dev, "i2c");
+    i2c = (I2CBus *)qdev_get_child_bus(i2c_dev, "i2c");
 
     lcd_dev = sysbus_create_simple(TYPE_MUSICPAL_LCD, MP_LCD_BASE, NULL);
     key_dev = sysbus_create_simple(TYPE_MUSICPAL_KEY, -1, NULL);

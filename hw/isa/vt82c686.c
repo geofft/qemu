@@ -36,7 +36,7 @@
 
 typedef struct SuperIOConfig
 {
-    uint8_t config[0xff];
+    uint8_t config[0x100];
     uint8_t index;
     uint8_t data;
 } SuperIOConfig;
@@ -50,13 +50,13 @@ typedef struct VT82C686BState {
 static void superio_ioport_writeb(void *opaque, hwaddr addr, uint64_t data,
                                   unsigned size)
 {
-    int can_write;
     SuperIOConfig *superio_conf = opaque;
 
     DPRINTF("superio_ioport_writeb  address 0x%x  val 0x%x\n", addr, data);
     if (addr == 0x3f0) {
         superio_conf->index = data & 0xff;
     } else {
+        bool can_write = true;
         /* 0x3f1 */
         switch (superio_conf->index) {
         case 0x00 ... 0xdf:
@@ -68,30 +68,27 @@ static void superio_ioport_writeb(void *opaque, hwaddr addr, uint64_t data,
         case 0xf7:
         case 0xf9 ... 0xfb:
         case 0xfd ... 0xff:
-            can_write = 0;
+            can_write = false;
+            break;
+        case 0xe7:
+            if ((data & 0xff) != 0xfe) {
+                DPRINTF("change uart 1 base. unsupported yet\n");
+                can_write = false;
+            }
+            break;
+        case 0xe8:
+            if ((data & 0xff) != 0xbe) {
+                DPRINTF("change uart 2 base. unsupported yet\n");
+                can_write = false;
+            }
             break;
         default:
-            can_write = 1;
+            break;
 
-            if (can_write) {
-                switch (superio_conf->index) {
-                case 0xe7:
-                    if ((data & 0xff) != 0xfe) {
-                        DPRINTF("chage uart 1 base. unsupported yet\n");
-                    }
-                    break;
-                case 0xe8:
-                    if ((data & 0xff) != 0xbe) {
-                        DPRINTF("chage uart 2 base. unsupported yet\n");
-                    }
-                    break;
-
-                default:
-                    superio_conf->config[superio_conf->index] = data & 0xff;
-                }
-            }
         }
-        superio_conf->config[superio_conf->index] = data & 0xff;
+        if (can_write) {
+            superio_conf->config[superio_conf->index] = data & 0xff;
+        }
     }
 }
 
@@ -230,15 +227,14 @@ static const VMStateDescription vmstate_acpi = {
     .name = "vt82c686b_pm",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = vmstate_acpi_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, VT686PMState),
         VMSTATE_UINT16(ar.pm1.evt.sts, VT686PMState),
         VMSTATE_UINT16(ar.pm1.evt.en, VT686PMState),
         VMSTATE_UINT16(ar.pm1.cnt.cnt, VT686PMState),
         VMSTATE_STRUCT(apm, VT686PMState, 0, vmstate_apm, APMState),
-        VMSTATE_TIMER(ar.tmr.timer, VT686PMState),
+        VMSTATE_TIMER_PTR(ar.tmr.timer, VT686PMState),
         VMSTATE_INT64(ar.tmr.overflow_time, VT686PMState),
         VMSTATE_END_OF_LIST()
     }
@@ -249,7 +245,7 @@ static const VMStateDescription vmstate_acpi = {
  * just register a PCI device now, functionalities will be implemented later.
  */
 
-static int vt82c686b_ac97_initfn(PCIDevice *dev)
+static void vt82c686b_ac97_realize(PCIDevice *dev, Error **errp)
 {
     VT686AC97State *s = DO_UPCAST(VT686AC97State, dev, dev);
     uint8_t *pci_conf = s->dev.config;
@@ -259,8 +255,6 @@ static int vt82c686b_ac97_initfn(PCIDevice *dev)
     pci_set_word(pci_conf + PCI_STATUS, PCI_STATUS_CAP_LIST |
                  PCI_STATUS_DEVSEL_MEDIUM);
     pci_set_long(pci_conf + PCI_INTERRUPT_PIN, 0x03);
-
-    return 0;
 }
 
 void vt82c686b_ac97_init(PCIBus *bus, int devfn)
@@ -276,7 +270,7 @@ static void via_ac97_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = vt82c686b_ac97_initfn;
+    k->realize = vt82c686b_ac97_realize;
     k->vendor_id = PCI_VENDOR_ID_VIA;
     k->device_id = PCI_DEVICE_ID_VIA_AC97;
     k->revision = 0x50;
@@ -292,7 +286,7 @@ static const TypeInfo via_ac97_info = {
     .class_init    = via_ac97_class_init,
 };
 
-static int vt82c686b_mc97_initfn(PCIDevice *dev)
+static void vt82c686b_mc97_realize(PCIDevice *dev, Error **errp)
 {
     VT686MC97State *s = DO_UPCAST(VT686MC97State, dev, dev);
     uint8_t *pci_conf = s->dev.config;
@@ -301,8 +295,6 @@ static int vt82c686b_mc97_initfn(PCIDevice *dev)
                  PCI_COMMAND_VGA_PALETTE);
     pci_set_word(pci_conf + PCI_STATUS, PCI_STATUS_DEVSEL_MEDIUM);
     pci_set_long(pci_conf + PCI_INTERRUPT_PIN, 0x03);
-
-    return 0;
 }
 
 void vt82c686b_mc97_init(PCIBus *bus, int devfn)
@@ -318,7 +310,7 @@ static void via_mc97_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = vt82c686b_mc97_initfn;
+    k->realize = vt82c686b_mc97_realize;
     k->vendor_id = PCI_VENDOR_ID_VIA;
     k->device_id = PCI_DEVICE_ID_VIA_MC97;
     k->class_id = PCI_CLASS_COMMUNICATION_OTHER;
@@ -335,7 +327,7 @@ static const TypeInfo via_mc97_info = {
 };
 
 /* vt82c686 pm init */
-static int vt82c686b_pm_initfn(PCIDevice *dev)
+static void vt82c686b_pm_realize(PCIDevice *dev, Error **errp)
 {
     VT686PMState *s = DO_UPCAST(VT686PMState, dev, dev);
     uint8_t *pci_conf;
@@ -365,12 +357,10 @@ static int vt82c686b_pm_initfn(PCIDevice *dev)
     acpi_pm_tmr_init(&s->ar, pm_tmr_timer, &s->io);
     acpi_pm1_evt_init(&s->ar, pm_tmr_timer, &s->io);
     acpi_pm1_cnt_init(&s->ar, &s->io, 2);
-
-    return 0;
 }
 
-i2c_bus *vt82c686b_pm_init(PCIBus *bus, int devfn, uint32_t smb_io_base,
-                       qemu_irq sci_irq)
+I2CBus *vt82c686b_pm_init(PCIBus *bus, int devfn, uint32_t smb_io_base,
+                          qemu_irq sci_irq)
 {
     PCIDevice *dev;
     VT686PMState *s;
@@ -395,7 +385,7 @@ static void via_pm_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = vt82c686b_pm_initfn;
+    k->realize = vt82c686b_pm_realize;
     k->config_write = pm_write_config;
     k->vendor_id = PCI_VENDOR_ID_VIA;
     k->device_id = PCI_DEVICE_ID_VIA_ACPI;
@@ -418,15 +408,14 @@ static const VMStateDescription vmstate_via = {
     .name = "vt82c686b",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, VT82C686BState),
         VMSTATE_END_OF_LIST()
     }
 };
 
 /* init the PCI-to-ISA bridge */
-static int vt82c686b_initfn(PCIDevice *d)
+static void vt82c686b_realize(PCIDevice *d, Error **errp)
 {
     VT82C686BState *vt82c = DO_UPCAST(VT82C686BState, dev, d);
     uint8_t *pci_conf;
@@ -434,7 +423,8 @@ static int vt82c686b_initfn(PCIDevice *d)
     uint8_t *wmask;
     int i;
 
-    isa_bus = isa_bus_new(&d->qdev, pci_address_space_io(d));
+    isa_bus = isa_bus_new(DEVICE(d), get_system_memory(),
+                          pci_address_space_io(d));
 
     pci_conf = d->config;
     pci_config_set_prog_interface(pci_conf, 0x0);
@@ -455,8 +445,6 @@ static int vt82c686b_initfn(PCIDevice *d)
                                 &vt82c->superio);
 
     qemu_register_reset(vt82c686b_reset, d);
-
-    return 0;
 }
 
 ISABus *vt82c686b_init(PCIBus *bus, int devfn)
@@ -473,15 +461,19 @@ static void via_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = vt82c686b_initfn;
+    k->realize = vt82c686b_realize;
     k->config_write = vt82c686b_write_config;
     k->vendor_id = PCI_VENDOR_ID_VIA;
     k->device_id = PCI_DEVICE_ID_VIA_ISA_BRIDGE;
     k->class_id = PCI_CLASS_BRIDGE_ISA;
     k->revision = 0x40;
     dc->desc = "ISA bridge";
-    dc->no_user = 1;
     dc->vmsd = &vmstate_via;
+    /*
+     * Reason: part of VIA VT82C686 southbridge, needs to be wired up,
+     * e.g. by mips_fulong2e_init()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo via_info = {

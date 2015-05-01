@@ -31,13 +31,21 @@ typedef struct MirrorBlockJob {
     BlockJob common;
     RateLimit limit;
     BlockDriverState *target;
-    MirrorSyncMode mode;
+    BlockDriverState *base;
+    /* The name of the graph node to replace */
+    char *replaces;
+    /* The BDS to replace */
+    BlockDriverState *to_replace;
+    /* Used to block operations on the drive-mirror-replace target */
+    Error *replace_blocker;
+    bool is_none_mode;
     BlockdevOnError on_source_error, on_target_error;
     bool synced;
     bool should_complete;
     int64_t sector_num;
     int64_t granularity;
     size_t buf_size;
+    int64_t bdev_length;
     unsigned long *cow_bitmap;
     BdrvDirtyBitmap *dirty_bitmap;
     HBitmapIter hbi;
@@ -47,6 +55,7 @@ typedef struct MirrorBlockJob {
 
     unsigned long *in_flight_bitmap;
     int in_flight;
+    int sectors_in_flight;
     int ret;
 } MirrorBlockJob;
 
@@ -80,6 +89,7 @@ static void mirror_iteration_done(MirrorOp *op, int ret)
     trace_mirror_iteration_done(s, op->sector_num, op->nb_sectors, ret);
 
     s->in_flight--;
+    s->sectors_in_flight -= op->nb_sectors;
     iov = op->qiov.iov;
     for (i = 0; i < op->qiov.niov; i++) {
         MirrorBuffer *buf = (MirrorBuffer *) iov[i].iov_base;
@@ -91,12 +101,23 @@ static void mirror_iteration_done(MirrorOp *op, int ret)
     chunk_num = op->sector_num / sectors_per_chunk;
     nb_chunks = op->nb_sectors / sectors_per_chunk;
     bitmap_clear(s->in_flight_bitmap, chunk_num, nb_chunks);
-    if (s->cow_bitmap && ret >= 0) {
-        bitmap_set(s->cow_bitmap, chunk_num, nb_chunks);
+    if (ret >= 0) {
+        if (s->cow_bitmap) {
+            bitmap_set(s->cow_bitmap, chunk_num, nb_chunks);
+        }
+        s->common.offset += (uint64_t)op->nb_sectors * BDRV_SECTOR_SIZE;
     }
 
+    qemu_iovec_destroy(&op->qiov);
     g_slice_free(MirrorOp, op);
-    qemu_coroutine_enter(s->common.co, NULL);
+
+    /* Enter coroutine when it is not sleeping.  The coroutine sleeps to
+     * rate-limit itself.  The coroutine will eventually resume since there is
+     * a sleep timeout so don't wake it early.
+     */
+    if (s->common.busy) {
+        qemu_coroutine_enter(s->common.co, NULL);
+    }
 }
 
 static void mirror_write_complete(void *opaque, int ret)
@@ -107,9 +128,10 @@ static void mirror_write_complete(void *opaque, int ret)
         BlockDriverState *source = s->common.bs;
         BlockErrorAction action;
 
-        bdrv_set_dirty(source, op->sector_num, op->nb_sectors);
+        bdrv_set_dirty_bitmap(source, s->dirty_bitmap, op->sector_num,
+                              op->nb_sectors);
         action = mirror_error_action(s, false, -ret);
-        if (action == BDRV_ACTION_REPORT && s->ret >= 0) {
+        if (action == BLOCK_ERROR_ACTION_REPORT && s->ret >= 0) {
             s->ret = ret;
         }
     }
@@ -124,9 +146,10 @@ static void mirror_read_complete(void *opaque, int ret)
         BlockDriverState *source = s->common.bs;
         BlockErrorAction action;
 
-        bdrv_set_dirty(source, op->sector_num, op->nb_sectors);
+        bdrv_set_dirty_bitmap(source, s->dirty_bitmap, op->sector_num,
+                              op->nb_sectors);
         action = mirror_error_action(s, true, -ret);
-        if (action == BDRV_ACTION_REPORT && s->ret >= 0) {
+        if (action == BLOCK_ERROR_ACTION_REPORT && s->ret >= 0) {
             s->ret = ret;
         }
 
@@ -137,11 +160,12 @@ static void mirror_read_complete(void *opaque, int ret)
                     mirror_write_complete, op);
 }
 
-static void coroutine_fn mirror_iteration(MirrorBlockJob *s)
+static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
 {
     BlockDriverState *source = s->common.bs;
     int nb_sectors, sectors_per_chunk, nb_chunks;
     int64_t end, sector_num, next_chunk, next_sector, hbitmap_next_sector;
+    uint64_t delay_ns = 0;
     MirrorOp *op;
 
     s->sector_num = hbitmap_iter_next(&s->hbi);
@@ -156,7 +180,7 @@ static void coroutine_fn mirror_iteration(MirrorBlockJob *s)
     hbitmap_next_sector = s->sector_num;
     sector_num = s->sector_num;
     sectors_per_chunk = s->granularity >> BDRV_SECTOR_BITS;
-    end = s->common.len >> BDRV_SECTOR_BITS;
+    end = s->bdev_length / BDRV_SECTOR_SIZE;
 
     /* Extend the QEMUIOVector to include all adjacent blocks that will
      * be copied in this operation.
@@ -229,7 +253,10 @@ static void coroutine_fn mirror_iteration(MirrorBlockJob *s)
         nb_chunks += added_chunks;
         next_sector += added_sectors;
         next_chunk += added_chunks;
-    } while (next_sector < end);
+        if (!s->synced && s->common.speed) {
+            delay_ns = ratelimit_calculate_delay(&s->limit, added_sectors);
+        }
+    } while (delay_ns == 0 && next_sector < end);
 
     /* Allocate a MirrorOp that is used as an AIO callback.  */
     op = g_slice_new(MirrorOp);
@@ -244,9 +271,11 @@ static void coroutine_fn mirror_iteration(MirrorBlockJob *s)
     next_sector = sector_num;
     while (nb_chunks-- > 0) {
         MirrorBuffer *buf = QSIMPLEQ_FIRST(&s->buf_free);
+        size_t remaining = (nb_sectors * BDRV_SECTOR_SIZE) - op->qiov.size;
+
         QSIMPLEQ_REMOVE_HEAD(&s->buf_free, next);
         s->buf_free_count--;
-        qemu_iovec_add(&op->qiov, buf, s->granularity);
+        qemu_iovec_add(&op->qiov, buf, MIN(s->granularity, remaining));
 
         /* Advance the HBitmapIter in parallel, so that we do not examine
          * the same sector twice.
@@ -259,13 +288,16 @@ static void coroutine_fn mirror_iteration(MirrorBlockJob *s)
         next_sector += sectors_per_chunk;
     }
 
-    bdrv_reset_dirty(source, sector_num, nb_sectors);
+    bdrv_reset_dirty_bitmap(source, s->dirty_bitmap, sector_num,
+                            nb_sectors);
 
     /* Copy the dirty cluster.  */
     s->in_flight++;
+    s->sectors_in_flight += nb_sectors;
     trace_mirror_one_iteration(s, sector_num, nb_sectors);
     bdrv_aio_readv(source, sector_num, &op->qiov, nb_sectors,
                    mirror_read_complete, op);
+    return delay_ns;
 }
 
 static void mirror_free_init(MirrorBlockJob *s)
@@ -292,14 +324,62 @@ static void mirror_drain(MirrorBlockJob *s)
     }
 }
 
+typedef struct {
+    int ret;
+} MirrorExitData;
+
+static void mirror_exit(BlockJob *job, void *opaque)
+{
+    MirrorBlockJob *s = container_of(job, MirrorBlockJob, common);
+    MirrorExitData *data = opaque;
+    AioContext *replace_aio_context = NULL;
+
+    if (s->to_replace) {
+        replace_aio_context = bdrv_get_aio_context(s->to_replace);
+        aio_context_acquire(replace_aio_context);
+    }
+
+    if (s->should_complete && data->ret == 0) {
+        BlockDriverState *to_replace = s->common.bs;
+        if (s->to_replace) {
+            to_replace = s->to_replace;
+        }
+        if (bdrv_get_flags(s->target) != bdrv_get_flags(to_replace)) {
+            bdrv_reopen(s->target, bdrv_get_flags(to_replace), NULL);
+        }
+        bdrv_swap(s->target, to_replace);
+        if (s->common.driver->job_type == BLOCK_JOB_TYPE_COMMIT) {
+            /* drop the bs loop chain formed by the swap: break the loop then
+             * trigger the unref from the top one */
+            BlockDriverState *p = s->base->backing_hd;
+            bdrv_set_backing_hd(s->base, NULL);
+            bdrv_unref(p);
+        }
+    }
+    if (s->to_replace) {
+        bdrv_op_unblock_all(s->to_replace, s->replace_blocker);
+        error_free(s->replace_blocker);
+        bdrv_unref(s->to_replace);
+    }
+    if (replace_aio_context) {
+        aio_context_release(replace_aio_context);
+    }
+    g_free(s->replaces);
+    bdrv_unref(s->target);
+    block_job_completed(&s->common, data->ret);
+    g_free(data);
+}
+
 static void coroutine_fn mirror_run(void *opaque)
 {
     MirrorBlockJob *s = opaque;
+    MirrorExitData *data;
     BlockDriverState *bs = s->common.bs;
     int64_t sector_num, end, sectors_per_chunk, length;
     uint64_t last_pause_ns;
     BlockDriverInfo bdi;
-    char backing_filename[1024];
+    char backing_filename[2]; /* we only need 2 characters because we are only
+                                 checking for a NULL string */
     int ret = 0;
     int n;
 
@@ -307,13 +387,22 @@ static void coroutine_fn mirror_run(void *opaque)
         goto immediate_exit;
     }
 
-    s->common.len = bdrv_getlength(bs);
-    if (s->common.len <= 0) {
-        block_job_completed(&s->common, s->common.len);
-        return;
+    s->bdev_length = bdrv_getlength(bs);
+    if (s->bdev_length < 0) {
+        ret = s->bdev_length;
+        goto immediate_exit;
+    } else if (s->bdev_length == 0) {
+        /* Report BLOCK_JOB_READY and wait for complete. */
+        block_job_event_ready(&s->common);
+        s->synced = true;
+        while (!block_job_is_cancelled(&s->common) && !s->should_complete) {
+            block_job_yield(&s->common);
+        }
+        s->common.cancelled = false;
+        goto immediate_exit;
     }
 
-    length = (bdrv_getlength(bs) + s->granularity - 1) / s->granularity;
+    length = DIV_ROUND_UP(s->bdev_length, s->granularity);
     s->in_flight_bitmap = bitmap_new(length);
 
     /* If we have no backing file yet in the destination, we cannot let
@@ -323,22 +412,29 @@ static void coroutine_fn mirror_run(void *opaque)
     bdrv_get_backing_filename(s->target, backing_filename,
                               sizeof(backing_filename));
     if (backing_filename[0] && !s->target->backing_hd) {
-        bdrv_get_info(s->target, &bdi);
+        ret = bdrv_get_info(s->target, &bdi);
+        if (ret < 0) {
+            goto immediate_exit;
+        }
         if (s->granularity < bdi.cluster_size) {
             s->buf_size = MAX(s->buf_size, bdi.cluster_size);
             s->cow_bitmap = bitmap_new(length);
         }
     }
 
-    end = s->common.len >> BDRV_SECTOR_BITS;
-    s->buf = qemu_blockalign(bs, s->buf_size);
+    end = s->bdev_length / BDRV_SECTOR_SIZE;
+    s->buf = qemu_try_blockalign(bs, s->buf_size);
+    if (s->buf == NULL) {
+        ret = -ENOMEM;
+        goto immediate_exit;
+    }
+
     sectors_per_chunk = s->granularity >> BDRV_SECTOR_BITS;
     mirror_free_init(s);
 
-    if (s->mode != MIRROR_SYNC_MODE_NONE) {
+    if (!s->is_none_mode) {
         /* First part, loop on the sectors and initialize the dirty bitmap.  */
-        BlockDriverState *base;
-        base = s->mode == MIRROR_SYNC_MODE_FULL ? NULL : bs->backing_hd;
+        BlockDriverState *base = s->base;
         for (sector_num = 0; sector_num < end; ) {
             int64_t next = (sector_num | (sectors_per_chunk - 1)) + 1;
             ret = bdrv_is_allocated_above(bs, base,
@@ -350,7 +446,7 @@ static void coroutine_fn mirror_run(void *opaque)
 
             assert(n > 0);
             if (ret == 1) {
-                bdrv_set_dirty(bs, sector_num, n);
+                bdrv_set_dirty_bitmap(bs, s->dirty_bitmap, sector_num, n);
                 sector_num = next;
             } else {
                 sector_num += n;
@@ -361,7 +457,7 @@ static void coroutine_fn mirror_run(void *opaque)
     bdrv_dirty_iter_init(bs, s->dirty_bitmap, &s->hbi);
     last_pause_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     for (;;) {
-        uint64_t delay_ns;
+        uint64_t delay_ns = 0;
         int64_t cnt;
         bool should_complete;
 
@@ -371,6 +467,12 @@ static void coroutine_fn mirror_run(void *opaque)
         }
 
         cnt = bdrv_get_dirty_count(bs, s->dirty_bitmap);
+        /* s->common.offset contains the number of bytes already processed so
+         * far, cnt is the number of dirty sectors remaining and
+         * s->sectors_in_flight is the number of sectors currently being
+         * processed; together those are the current total operation length */
+        s->common.len = s->common.offset +
+                        (cnt + s->sectors_in_flight) * BDRV_SECTOR_SIZE;
 
         /* Note that even when no rate limit is applied we need to yield
          * periodically with no pending I/O so that qemu_aio_flush() returns.
@@ -385,8 +487,10 @@ static void coroutine_fn mirror_run(void *opaque)
                 qemu_coroutine_yield();
                 continue;
             } else if (cnt != 0) {
-                mirror_iteration(s);
-                continue;
+                delay_ns = mirror_iteration(s);
+                if (delay_ns == 0) {
+                    continue;
+                }
             }
         }
 
@@ -395,7 +499,8 @@ static void coroutine_fn mirror_run(void *opaque)
             trace_mirror_before_flush(s);
             ret = bdrv_flush(s->target);
             if (ret < 0) {
-                if (mirror_error_action(s, false, -ret) == BDRV_ACTION_REPORT) {
+                if (mirror_error_action(s, false, -ret) ==
+                    BLOCK_ERROR_ACTION_REPORT) {
                     goto immediate_exit;
                 }
             } else {
@@ -404,9 +509,8 @@ static void coroutine_fn mirror_run(void *opaque)
                  * report completion.  This way, block-job-cancel will leave
                  * the target in a consistent state.
                  */
-                s->common.offset = end * BDRV_SECTOR_SIZE;
                 if (!s->synced) {
-                    block_job_ready(&s->common);
+                    block_job_event_ready(&s->common);
                     s->synced = true;
                 }
 
@@ -426,22 +530,13 @@ static void coroutine_fn mirror_run(void *opaque)
              * mirror_populate runs.
              */
             trace_mirror_before_drain(s, cnt);
-            bdrv_drain_all();
+            bdrv_drain(bs);
             cnt = bdrv_get_dirty_count(bs, s->dirty_bitmap);
         }
 
         ret = 0;
-        trace_mirror_before_sleep(s, cnt, s->synced);
+        trace_mirror_before_sleep(s, cnt, s->synced, delay_ns);
         if (!s->synced) {
-            /* Publish progress */
-            s->common.offset = (end - cnt) * BDRV_SECTOR_SIZE;
-
-            if (s->common.speed) {
-                delay_ns = ratelimit_calculate_delay(&s->limit, sectors_per_chunk);
-            } else {
-                delay_ns = 0;
-            }
-
             block_job_sleep_ns(&s->common, QEMU_CLOCK_REALTIME, delay_ns);
             if (block_job_is_cancelled(&s->common)) {
                 break;
@@ -476,15 +571,10 @@ immediate_exit:
     g_free(s->in_flight_bitmap);
     bdrv_release_dirty_bitmap(bs, s->dirty_bitmap);
     bdrv_iostatus_disable(s->target);
-    if (s->should_complete && ret == 0) {
-        if (bdrv_get_flags(s->target) != bdrv_get_flags(s->common.bs)) {
-            bdrv_reopen(s->target, bdrv_get_flags(s->common.bs), NULL);
-        }
-        bdrv_swap(s->target, s->common.bs);
-    }
-    bdrv_close(s->target);
-    bdrv_unref(s->target);
-    block_job_completed(&s->common, ret);
+
+    data = g_malloc(sizeof(*data));
+    data->ret = ret;
+    block_job_defer_to_main_loop(&s->common, mirror_exit, data);
 }
 
 static void mirror_set_speed(BlockJob *job, int64_t speed, Error **errp)
@@ -513,15 +603,34 @@ static void mirror_complete(BlockJob *job, Error **errp)
 
     ret = bdrv_open_backing_file(s->target, NULL, &local_err);
     if (ret < 0) {
-        char backing_filename[PATH_MAX];
-        bdrv_get_full_backing_filename(s->target, backing_filename,
-                                       sizeof(backing_filename));
         error_propagate(errp, local_err);
         return;
     }
     if (!s->synced) {
-        error_set(errp, QERR_BLOCK_JOB_NOT_READY, job->bs->device_name);
+        error_set(errp, QERR_BLOCK_JOB_NOT_READY,
+                  bdrv_get_device_name(job->bs));
         return;
+    }
+
+    /* check the target bs is not blocked and block all operations on it */
+    if (s->replaces) {
+        AioContext *replace_aio_context;
+
+        s->to_replace = check_to_replace_node(s->replaces, &local_err);
+        if (!s->to_replace) {
+            error_propagate(errp, local_err);
+            return;
+        }
+
+        replace_aio_context = bdrv_get_aio_context(s->to_replace);
+        aio_context_acquire(replace_aio_context);
+
+        error_setg(&s->replace_blocker,
+                   "block device is in use by block-job-complete");
+        bdrv_op_block_all(s->to_replace, s->replace_blocker);
+        bdrv_ref(s->to_replace);
+
+        aio_context_release(replace_aio_context);
     }
 
     s->should_complete = true;
@@ -536,12 +645,25 @@ static const BlockJobDriver mirror_job_driver = {
     .complete      = mirror_complete,
 };
 
-void mirror_start(BlockDriverState *bs, BlockDriverState *target,
-                  int64_t speed, int64_t granularity, int64_t buf_size,
-                  MirrorSyncMode mode, BlockdevOnError on_source_error,
-                  BlockdevOnError on_target_error,
-                  BlockDriverCompletionFunc *cb,
-                  void *opaque, Error **errp)
+static const BlockJobDriver commit_active_job_driver = {
+    .instance_size = sizeof(MirrorBlockJob),
+    .job_type      = BLOCK_JOB_TYPE_COMMIT,
+    .set_speed     = mirror_set_speed,
+    .iostatus_reset
+                   = mirror_iostatus_reset,
+    .complete      = mirror_complete,
+};
+
+static void mirror_start_job(BlockDriverState *bs, BlockDriverState *target,
+                             const char *replaces,
+                             int64_t speed, int64_t granularity,
+                             int64_t buf_size,
+                             BlockdevOnError on_source_error,
+                             BlockdevOnError on_target_error,
+                             BlockCompletionFunc *cb,
+                             void *opaque, Error **errp,
+                             const BlockJobDriver *driver,
+                             bool is_none_mode, BlockDriverState *base)
 {
     MirrorBlockJob *s;
 
@@ -566,23 +688,108 @@ void mirror_start(BlockDriverState *bs, BlockDriverState *target,
         return;
     }
 
-    s = block_job_create(&mirror_job_driver, bs, speed, cb, opaque, errp);
+
+    s = block_job_create(driver, bs, speed, cb, opaque, errp);
     if (!s) {
         return;
     }
 
+    s->replaces = g_strdup(replaces);
     s->on_source_error = on_source_error;
     s->on_target_error = on_target_error;
     s->target = target;
-    s->mode = mode;
+    s->is_none_mode = is_none_mode;
+    s->base = base;
     s->granularity = granularity;
     s->buf_size = MAX(buf_size, granularity);
 
-    s->dirty_bitmap = bdrv_create_dirty_bitmap(bs, granularity);
+    s->dirty_bitmap = bdrv_create_dirty_bitmap(bs, granularity, errp);
+    if (!s->dirty_bitmap) {
+        return;
+    }
     bdrv_set_enable_write_cache(s->target, true);
     bdrv_set_on_error(s->target, on_target_error, on_target_error);
     bdrv_iostatus_enable(s->target);
     s->common.co = qemu_coroutine_create(mirror_run);
     trace_mirror_start(bs, s, s->common.co, opaque);
     qemu_coroutine_enter(s->common.co, s);
+}
+
+void mirror_start(BlockDriverState *bs, BlockDriverState *target,
+                  const char *replaces,
+                  int64_t speed, int64_t granularity, int64_t buf_size,
+                  MirrorSyncMode mode, BlockdevOnError on_source_error,
+                  BlockdevOnError on_target_error,
+                  BlockCompletionFunc *cb,
+                  void *opaque, Error **errp)
+{
+    bool is_none_mode;
+    BlockDriverState *base;
+
+    is_none_mode = mode == MIRROR_SYNC_MODE_NONE;
+    base = mode == MIRROR_SYNC_MODE_TOP ? bs->backing_hd : NULL;
+    mirror_start_job(bs, target, replaces,
+                     speed, granularity, buf_size,
+                     on_source_error, on_target_error, cb, opaque, errp,
+                     &mirror_job_driver, is_none_mode, base);
+}
+
+void commit_active_start(BlockDriverState *bs, BlockDriverState *base,
+                         int64_t speed,
+                         BlockdevOnError on_error,
+                         BlockCompletionFunc *cb,
+                         void *opaque, Error **errp)
+{
+    int64_t length, base_length;
+    int orig_base_flags;
+    int ret;
+    Error *local_err = NULL;
+
+    orig_base_flags = bdrv_get_flags(base);
+
+    if (bdrv_reopen(base, bs->open_flags, errp)) {
+        return;
+    }
+
+    length = bdrv_getlength(bs);
+    if (length < 0) {
+        error_setg_errno(errp, -length,
+                         "Unable to determine length of %s", bs->filename);
+        goto error_restore_flags;
+    }
+
+    base_length = bdrv_getlength(base);
+    if (base_length < 0) {
+        error_setg_errno(errp, -base_length,
+                         "Unable to determine length of %s", base->filename);
+        goto error_restore_flags;
+    }
+
+    if (length > base_length) {
+        ret = bdrv_truncate(base, length);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret,
+                            "Top image %s is larger than base image %s, and "
+                             "resize of base image failed",
+                             bs->filename, base->filename);
+            goto error_restore_flags;
+        }
+    }
+
+    bdrv_ref(base);
+    mirror_start_job(bs, base, NULL, speed, 0, 0,
+                     on_error, on_error, cb, opaque, &local_err,
+                     &commit_active_job_driver, false, base);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        goto error_restore_flags;
+    }
+
+    return;
+
+error_restore_flags:
+    /* ignore error and errp for bdrv_reopen, because we want to propagate
+     * the original error */
+    bdrv_reopen(base, orig_base_flags, NULL);
+    return;
 }

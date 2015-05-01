@@ -21,6 +21,7 @@ Scope(\_SB) {
     /* Objects filled in by run-time generated SSDT */
     External(NTFY, MethodObj)
     External(CPON, PkgObj)
+    External(PRS, FieldUnitObj)
 
     /* Methods called by run-time generated SSDT Processor objects */
     Method(CPMA, 1, NotSerialized) {
@@ -52,11 +53,7 @@ Scope(\_SB) {
         Sleep(200)
     }
 
-    /* CPU hotplug notify method */
-    OperationRegion(PRST, SystemIO, 0xaf00, 32)
-    Field(PRST, ByteAcc, NoLock, Preserve) {
-        PRS, 256
-    }
+#define CPU_STATUS_LEN ACPI_GPE_PROC_LEN
     Method(PRSC, 0) {
         // Local5 = active cpu bitmap
         Store(PRS, Local5)

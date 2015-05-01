@@ -19,26 +19,30 @@
 #include "qemu/queue.h"
 #include "qemu/event_notifier.h"
 #include "qemu/thread.h"
+#include "qemu/rfifolock.h"
 #include "qemu/timer.h"
 
-typedef struct BlockDriverAIOCB BlockDriverAIOCB;
-typedef void BlockDriverCompletionFunc(void *opaque, int ret);
+typedef struct BlockAIOCB BlockAIOCB;
+typedef void BlockCompletionFunc(void *opaque, int ret);
 
 typedef struct AIOCBInfo {
-    void (*cancel)(BlockDriverAIOCB *acb);
+    void (*cancel_async)(BlockAIOCB *acb);
+    AioContext *(*get_aio_context)(BlockAIOCB *acb);
     size_t aiocb_size;
 } AIOCBInfo;
 
-struct BlockDriverAIOCB {
+struct BlockAIOCB {
     const AIOCBInfo *aiocb_info;
     BlockDriverState *bs;
-    BlockDriverCompletionFunc *cb;
+    BlockCompletionFunc *cb;
     void *opaque;
+    int refcnt;
 };
 
 void *qemu_aio_get(const AIOCBInfo *aiocb_info, BlockDriverState *bs,
-                   BlockDriverCompletionFunc *cb, void *opaque);
-void qemu_aio_release(void *p);
+                   BlockCompletionFunc *cb, void *opaque);
+void qemu_aio_unref(void *p);
+void qemu_aio_ref(void *p);
 
 typedef struct AioHandler AioHandler;
 typedef void QEMUBHFunc(void *opaque);
@@ -46,6 +50,9 @@ typedef void IOHandler(void *opaque);
 
 struct AioContext {
     GSource source;
+
+    /* Protects all fields from multi-threaded access */
+    RFifoLock lock;
 
     /* The list of registered AIO handlers */
     QLIST_HEAD(, AioHandler) aio_handlers;
@@ -56,8 +63,14 @@ struct AioContext {
      */
     int walking_handlers;
 
+    /* Used to avoid unnecessary event_notifier_set calls in aio_notify.
+     * Writes protected by lock or BQL, reads are lockless.
+     */
+    bool dispatching;
+
     /* lock to protect between bh's adders and deleter */
     QemuMutex bh_lock;
+
     /* Anchor of the list of Bottom Halves belonging to the context */
     struct QEMUBH *first_bh;
 
@@ -79,6 +92,9 @@ struct AioContext {
     QEMUTimerListGroup tlg;
 };
 
+/* Used internally to synchronize aio_poll against qemu_bh_schedule.  */
+void aio_set_dispatching(AioContext *ctx, bool dispatching);
+
 /**
  * aio_context_new: Allocate a new AioContext.
  *
@@ -86,7 +102,7 @@ struct AioContext {
  * They also provide bottom halves, a service to execute a piece of code
  * as soon as possible.
  */
-AioContext *aio_context_new(void);
+AioContext *aio_context_new(Error **errp);
 
 /**
  * aio_context_ref:
@@ -103,6 +119,20 @@ void aio_context_ref(AioContext *ctx);
  * Drop a reference to an AioContext.
  */
 void aio_context_unref(AioContext *ctx);
+
+/* Take ownership of the AioContext.  If the AioContext will be shared between
+ * threads, a thread must have ownership when calling aio_poll().
+ *
+ * Note that multiple threads calling aio_poll() means timers, BHs, and
+ * callbacks may be invoked from a different thread than they were registered
+ * from.  Therefore, code must use AioContext acquire/release or use
+ * fine-grained synchronization to protect shared state if other threads will
+ * be accessing it simultaneously.
+ */
+void aio_context_acquire(AioContext *ctx);
+
+/* Relinquish ownership of the AioContext. */
+void aio_context_release(AioContext *ctx);
 
 /**
  * aio_bh_new: Allocate a new bottom half structure.
@@ -178,18 +208,31 @@ void qemu_bh_cancel(QEMUBH *bh);
 void qemu_bh_delete(QEMUBH *bh);
 
 /* Return whether there are any pending callbacks from the GSource
- * attached to the AioContext.
+ * attached to the AioContext, before g_poll is invoked.
+ *
+ * This is used internally in the implementation of the GSource.
+ */
+bool aio_prepare(AioContext *ctx);
+
+/* Return whether there are any pending callbacks from the GSource
+ * attached to the AioContext, after g_poll is invoked.
  *
  * This is used internally in the implementation of the GSource.
  */
 bool aio_pending(AioContext *ctx);
 
+/* Dispatch any pending callbacks from the GSource attached to the AioContext.
+ *
+ * This is used internally in the implementation of the GSource.
+ */
+bool aio_dispatch(AioContext *ctx);
+
 /* Progress in completing AIO work to occur.  This can issue new pending
  * aio as a result of executing I/O completion or bh callbacks.
  *
- * If there is no pending AIO operation or completion (bottom half),
- * return false.  If there are pending AIO operations of bottom halves,
- * return true.
+ * Return whether any progress was made by executing AIO or bottom half
+ * handlers.  If @blocking == true, this should always be true except
+ * if someone called aio_notify.
  *
  * If there are no pending bottom halves, but there are pending AIO
  * operations, it may not be possible to make any progress without
@@ -199,10 +242,9 @@ bool aio_pending(AioContext *ctx);
  */
 bool aio_poll(AioContext *ctx, bool blocking);
 
-#ifdef CONFIG_POSIX
 /* Register a file descriptor and associated callbacks.  Behaves very similarly
  * to qemu_set_fd_handler2.  Unlike qemu_set_fd_handler2, these callbacks will
- * be invoked when using qemu_aio_wait().
+ * be invoked when using aio_poll().
  *
  * Code that invokes AIO completion functions should rely on this function
  * instead of qemu_set_fd_handler[2].
@@ -212,11 +254,10 @@ void aio_set_fd_handler(AioContext *ctx,
                         IOHandler *io_read,
                         IOHandler *io_write,
                         void *opaque);
-#endif
 
 /* Register an event notifier and associated callbacks.  Behaves very similarly
  * to event_notifier_set_handler.  Unlike event_notifier_set_handler, these callbacks
- * will be invoked when using qemu_aio_wait().
+ * will be invoked when using aio_poll().
  *
  * Code that invokes AIO completion functions should rely on this function
  * instead of event_notifier_set_handler.
@@ -232,19 +273,6 @@ GSource *aio_get_g_source(AioContext *ctx);
 
 /* Return the ThreadPool bound to this AioContext */
 struct ThreadPool *aio_get_thread_pool(AioContext *ctx);
-
-/* Functions to operate on the main QEMU AioContext.  */
-
-bool qemu_aio_wait(void);
-void qemu_aio_set_event_notifier(EventNotifier *notifier,
-                                 EventNotifierHandler *io_read);
-
-#ifdef CONFIG_POSIX
-void qemu_aio_set_fd_handler(int fd,
-                             IOHandler *io_read,
-                             IOHandler *io_write,
-                             void *opaque);
-#endif
 
 /**
  * aio_timer_new:
@@ -286,7 +314,15 @@ static inline void aio_timer_init(AioContext *ctx,
                                   int scale,
                                   QEMUTimerCB *cb, void *opaque)
 {
-    timer_init(ts, ctx->tlg.tl[type], scale, cb, opaque);
+    timer_init_tl(ts, ctx->tlg.tl[type], scale, cb, opaque);
 }
+
+/**
+ * aio_compute_timeout:
+ * @ctx: the aio context
+ *
+ * Compute the timeout that a blocking aio_poll should use.
+ */
+int64_t aio_compute_timeout(AioContext *ctx);
 
 #endif

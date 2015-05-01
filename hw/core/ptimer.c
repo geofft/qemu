@@ -206,8 +206,7 @@ const VMStateDescription vmstate_ptimer = {
     .name = "ptimer",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8(enabled, ptimer_state),
         VMSTATE_UINT64(limit, ptimer_state),
         VMSTATE_UINT64(delta, ptimer_state),
@@ -215,7 +214,7 @@ const VMStateDescription vmstate_ptimer = {
         VMSTATE_INT64(period, ptimer_state),
         VMSTATE_INT64(last_event, ptimer_state),
         VMSTATE_INT64(next_event, ptimer_state),
-        VMSTATE_TIMER(timer, ptimer_state),
+        VMSTATE_TIMER_PTR(timer, ptimer_state),
         VMSTATE_END_OF_LIST()
     }
 };

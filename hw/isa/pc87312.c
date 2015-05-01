@@ -25,6 +25,7 @@
 
 #include "hw/isa/pc87312.h"
 #include "qemu/error-report.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/char.h"
@@ -84,11 +85,6 @@ static inline uint32_t get_parallel_irq(PC87312State *s)
     } else {
         return parallel_irq[idx];
     }
-}
-
-static inline bool is_parallel_epp(PC87312State *s)
-{
-    return s->regs[REG_PTR] & PTR_EPP_MODE;
 }
 
 
@@ -282,6 +278,7 @@ static void pc87312_realize(DeviceState *dev, Error **errp)
     pc87312_hard_reset(s);
 
     if (is_parallel_enabled(s)) {
+        /* FIXME use a qdev chardev prop instead of parallel_hds[] */
         chr = parallel_hds[0];
         if (chr == NULL) {
             chr = qemu_chr_new("par0", "null", NULL);
@@ -300,6 +297,7 @@ static void pc87312_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < 2; i++) {
         if (is_uart_enabled(s, i)) {
+            /* FIXME use a qdev chardev prop instead of serial_hds[] */
             chr = serial_hds[i];
             if (chr == NULL) {
                 snprintf(name, sizeof(name), "ser%d", i);
@@ -323,13 +321,17 @@ static void pc87312_realize(DeviceState *dev, Error **errp)
         d = DEVICE(isa);
         qdev_prop_set_uint32(d, "iobase", get_fdc_iobase(s));
         qdev_prop_set_uint32(d, "irq", 6);
+        /* FIXME use a qdev drive property instead of drive_get() */
         drive = drive_get(IF_FLOPPY, 0, 0);
         if (drive != NULL) {
-            qdev_prop_set_drive_nofail(d, "driveA", drive->bdrv);
+            qdev_prop_set_drive_nofail(d, "driveA",
+                                       blk_by_legacy_dinfo(drive));
         }
+        /* FIXME use a qdev drive property instead of drive_get() */
         drive = drive_get(IF_FLOPPY, 0, 1);
         if (drive != NULL) {
-            qdev_prop_set_drive_nofail(d, "driveB", drive->bdrv);
+            qdev_prop_set_drive_nofail(d, "driveB",
+                                       blk_by_legacy_dinfo(drive));
         }
         qdev_init_nofail(d);
         s->fdc.dev = isa;
@@ -369,7 +371,7 @@ static const VMStateDescription vmstate_pc87312 = {
 };
 
 static Property pc87312_properties[] = {
-    DEFINE_PROP_HEX32("iobase", PC87312State, iobase, 0x398),
+    DEFINE_PROP_UINT32("iobase", PC87312State, iobase, 0x398),
     DEFINE_PROP_UINT8("config", PC87312State, config, 1),
     DEFINE_PROP_END_OF_LIST()
 };

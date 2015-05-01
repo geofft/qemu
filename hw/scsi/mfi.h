@@ -60,6 +60,7 @@
 #define MFI_ODR0        0x9c            /* outbound doorbell register0 */
 #define MFI_ODCR0       0xa0            /* outbound doorbell clear register0  */
 #define MFI_OSP0        0xb0            /* outbound scratch pad0  */
+#define MFI_OSP1        0xb4            /* outbound scratch pad1  */
 #define MFI_IQPL        0xc0            /* Inbound queue port (low bytes)  */
 #define MFI_IQPH        0xc4            /* Inbound queue port (high bytes)  */
 #define MFI_DIAG        0xf8            /* Host diag */
@@ -116,6 +117,12 @@
 #define MFI_FWINIT_STOP_ADP     0x00000020 /* Move to operational, stop */
 #define MFI_FWINIT_ADP_RESET    0x00000040 /* Reset ADP */
 
+/*
+ * Control bits for the DIAG register
+ */
+#define MFI_DIAG_WRITE_ENABLE 0x00000080
+#define MFI_DIAG_RESET_ADP    0x00000004
+
 /* MFI Commands */
 typedef enum {
     MFI_CMD_INIT = 0x00,
@@ -164,6 +171,7 @@ typedef enum {
     MFI_DCMD_PD_BLINK =                 0x02070100,
     MFI_DCMD_PD_UNBLINK =               0x02070200,
     MFI_DCMD_LD_GET_LIST =              0x03010000,
+    MFI_DCMD_LD_LIST_QUERY =            0x03010100,
     MFI_DCMD_LD_GET_INFO =              0x03020000,
     MFI_DCMD_LD_GET_PROP =              0x03030000,
     MFI_DCMD_LD_SET_PROP =              0x03040000,
@@ -410,6 +418,14 @@ typedef enum {
     MR_PD_QUERY_TYPE_SPEED =            4,
     MR_PD_QUERY_TYPE_EXPOSED_TO_HOST =  5, /*query for system drives */
 } mfi_pd_query_type;
+
+typedef enum {
+    MR_LD_QUERY_TYPE_ALL =              0,
+    MR_LD_QUERY_TYPE_EXPOSED_TO_HOST =  1,
+    MR_LD_QUERY_TYPE_USED_TGT_IDS =     2,
+    MR_LD_QUERY_TYPE_CLUSTER_ACCESS =   3,
+    MR_LD_QUERY_TYPE_CLUSTER_LOCALE =   4,
+} mfi_ld_query_type;
 
 /*
  * Other propertities and definitions
@@ -1085,7 +1101,7 @@ struct mfi_pd_list {
 union mfi_ld_ref {
     struct {
         uint8_t target_id;
-        uint8_t lun_id;
+        uint8_t reserved;
         uint16_t seq;
     } v;
     uint32_t ref;
@@ -1100,6 +1116,13 @@ struct mfi_ld_list {
         uint8_t reserved2[3];
         uint64_t size;
     } ld_list[MFI_MAX_LD];
+} QEMU_PACKED;
+
+struct mfi_ld_targetid_list {
+    uint32_t size;
+    uint32_t ld_count;
+    uint8_t pad[3];
+    uint8_t targetid[MFI_MAX_LD];
 } QEMU_PACKED;
 
 enum mfi_ld_access {

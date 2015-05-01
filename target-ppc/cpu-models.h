@@ -39,7 +39,6 @@ extern PowerPCCPUAlias ppc_cpu_aliases[];
 /*****************************************************************************/
 /* PVR definitions for most known PowerPC                                    */
 enum {
-    CPU_POWERPC_DEFAULT_MASK       = 0xFFFFFFFF,
     /* PowerPC 401 family */
     /* Generic PowerPC 401 */
 #define CPU_POWERPC_401              CPU_POWERPC_401G2
@@ -548,29 +547,25 @@ enum {
     CPU_POWERPC_POWER4P            = 0x00380000,
      /* XXX: missing 0x003A0201 */
     CPU_POWERPC_POWER5             = 0x003A0203,
-    CPU_POWERPC_POWER5P            = 0x003B0000,
     CPU_POWERPC_POWER5P_v21        = 0x003B0201,
     CPU_POWERPC_POWER6             = 0x003E0000,
     CPU_POWERPC_POWER6_5           = 0x0F000001, /* POWER6 in POWER5 mode */
     CPU_POWERPC_POWER6A            = 0x0F000002,
+    CPU_POWERPC_POWER_SERVER_MASK  = 0xFFFF0000,
     CPU_POWERPC_POWER7_BASE        = 0x003F0000,
-    CPU_POWERPC_POWER7_MASK        = 0xFFFF0000,
-    CPU_POWERPC_POWER7_v20         = 0x003F0200,
-    CPU_POWERPC_POWER7_v21         = 0x003F0201,
     CPU_POWERPC_POWER7_v23         = 0x003F0203,
     CPU_POWERPC_POWER7P_BASE       = 0x004A0000,
-    CPU_POWERPC_POWER7P_MASK       = 0xFFFF0000,
     CPU_POWERPC_POWER7P_v21        = 0x004A0201,
-    CPU_POWERPC_POWER8_BASE        = 0x004B0000,
-    CPU_POWERPC_POWER8_MASK        = 0xFFFF0000,
-    CPU_POWERPC_POWER8_v10         = 0x004B0100,
-    CPU_POWERPC_970                = 0x00390202,
+    CPU_POWERPC_POWER8E_BASE       = 0x004B0000,
+    CPU_POWERPC_POWER8E_v10        = 0x004B0100,
+    CPU_POWERPC_POWER8_BASE        = 0x004D0000,
+    CPU_POWERPC_POWER8_v10         = 0x004D0100,
+    CPU_POWERPC_970_v22            = 0x00390202,
     CPU_POWERPC_970FX_v10          = 0x00391100,
     CPU_POWERPC_970FX_v20          = 0x003C0200,
     CPU_POWERPC_970FX_v21          = 0x003C0201,
     CPU_POWERPC_970FX_v30          = 0x003C0300,
     CPU_POWERPC_970FX_v31          = 0x003C0301,
-    CPU_POWERPC_970GX              = 0x00450000,
     CPU_POWERPC_970MP_v10          = 0x00440100,
     CPU_POWERPC_970MP_v11          = 0x00440101,
 #define CPU_POWERPC_CELL             CPU_POWERPC_CELL_v32
@@ -596,6 +591,16 @@ enum {
 #endif
     /* PA Semi core */
     CPU_POWERPC_PA6T               = 0x00900000,
+};
+
+/* Logical PVR definitions for sPAPR */
+enum {
+    CPU_POWERPC_LOGICAL_2_04       = 0x0F000001,
+    CPU_POWERPC_LOGICAL_2_05       = 0x0F000002,
+    CPU_POWERPC_LOGICAL_2_06       = 0x0F000003,
+    CPU_POWERPC_LOGICAL_2_06_PLUS  = 0x0F100003,
+    CPU_POWERPC_LOGICAL_2_07       = 0x0F000004,
+    CPU_POWERPC_LOGICAL_2_08       = 0x0F000005,
 };
 
 /* System version register (used on MPC 8xxx)                                */

@@ -89,9 +89,6 @@ typedef struct {
     VirtioBusState bus;
 } VirtIOMMIOProxy;
 
-static void virtio_mmio_bus_new(VirtioBusState *bus, size_t bus_size,
-                                VirtIOMMIOProxy *dev);
-
 static uint64_t virtio_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     VirtIOMMIOProxy *proxy = (VirtIOMMIOProxy *)opaque;
@@ -352,7 +349,7 @@ static void virtio_mmio_device_plugged(DeviceState *opaque)
 {
     VirtIOMMIOProxy *proxy = VIRTIO_MMIO(opaque);
 
-    proxy->host_features |= (0x1 << VIRTIO_F_NOTIFY_ON_EMPTY);
+    virtio_add_feature(&proxy->host_features, VIRTIO_F_NOTIFY_ON_EMPTY);
     proxy->host_features = virtio_bus_get_vdev_features(&proxy->bus,
                                                         proxy->host_features);
 }
@@ -362,17 +359,24 @@ static void virtio_mmio_realizefn(DeviceState *d, Error **errp)
     VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
     SysBusDevice *sbd = SYS_BUS_DEVICE(d);
 
-    virtio_mmio_bus_new(&proxy->bus, sizeof(proxy->bus), proxy);
+    qbus_create_inplace(&proxy->bus, sizeof(proxy->bus), TYPE_VIRTIO_MMIO_BUS,
+                        d, NULL);
     sysbus_init_irq(sbd, &proxy->irq);
     memory_region_init_io(&proxy->iomem, OBJECT(d), &virtio_mem_ops, proxy,
                           TYPE_VIRTIO_MMIO, 0x200);
     sysbus_init_mmio(sbd, &proxy->iomem);
 }
 
+static Property virtio_mmio_properties[] = {
+    DEFINE_VIRTIO_COMMON_FEATURES(VirtIOMMIOProxy, host_features),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void virtio_mmio_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->props = virtio_mmio_properties;
     dc->realize = virtio_mmio_realizefn;
     dc->reset = virtio_mmio_reset;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
@@ -386,17 +390,6 @@ static const TypeInfo virtio_mmio_info = {
 };
 
 /* virtio-mmio-bus. */
-
-static void virtio_mmio_bus_new(VirtioBusState *bus, size_t bus_size,
-                                VirtIOMMIOProxy *dev)
-{
-    DeviceState *qdev = DEVICE(dev);
-    BusState *qbus;
-
-    qbus_create_inplace(bus, bus_size, TYPE_VIRTIO_MMIO_BUS, qdev, NULL);
-    qbus = BUS(bus);
-    qbus->allow_hotplug = 0;
-}
 
 static void virtio_mmio_bus_class_init(ObjectClass *klass, void *data)
 {

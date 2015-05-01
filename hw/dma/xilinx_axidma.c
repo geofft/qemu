@@ -157,11 +157,6 @@ static inline int stream_running(struct Stream *s)
     return s->regs[R_DMACR] & DMACR_RUNSTOP;
 }
 
-static inline int stream_halted(struct Stream *s)
-{
-    return s->regs[R_DMASR] & DMASR_HALTED;
-}
-
 static inline int stream_idle(struct Stream *s)
 {
     return !!(s->regs[R_DMASR] & DMASR_IDLE);
@@ -534,34 +529,42 @@ static void xilinx_axidma_realize(DeviceState *dev, Error **errp)
     XilinxAXIDMAStreamSlave *ds = XILINX_AXI_DMA_DATA_STREAM(&s->rx_data_dev);
     XilinxAXIDMAStreamSlave *cs = XILINX_AXI_DMA_CONTROL_STREAM(
                                                             &s->rx_control_dev);
-    Error *local_errp = NULL;
+    Error *local_err = NULL;
 
     object_property_add_link(OBJECT(ds), "dma", TYPE_XILINX_AXI_DMA,
-                             (Object **)&ds->dma, &local_errp);
+                             (Object **)&ds->dma,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
+                             &local_err);
     object_property_add_link(OBJECT(cs), "dma", TYPE_XILINX_AXI_DMA,
-                             (Object **)&cs->dma, &local_errp);
-    if (local_errp) {
+                             (Object **)&cs->dma,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
+                             &local_err);
+    if (local_err) {
         goto xilinx_axidma_realize_fail;
     }
-    object_property_set_link(OBJECT(ds), OBJECT(s), "dma", &local_errp);
-    object_property_set_link(OBJECT(cs), OBJECT(s), "dma", &local_errp);
-    if (local_errp) {
+    object_property_set_link(OBJECT(ds), OBJECT(s), "dma", &local_err);
+    object_property_set_link(OBJECT(cs), OBJECT(s), "dma", &local_err);
+    if (local_err) {
         goto xilinx_axidma_realize_fail;
     }
 
     int i;
 
     for (i = 0; i < 2; i++) {
-        s->streams[i].nr = i;
-        s->streams[i].bh = qemu_bh_new(timer_hit, &s->streams[i]);
-        s->streams[i].ptimer = ptimer_init(s->streams[i].bh);
-        ptimer_set_freq(s->streams[i].ptimer, s->freqhz);
+        struct Stream *st = &s->streams[i];
+
+        st->nr = i;
+        st->bh = qemu_bh_new(timer_hit, st);
+        st->ptimer = ptimer_init(st->bh);
+        ptimer_set_freq(st->ptimer, s->freqhz);
     }
     return;
 
 xilinx_axidma_realize_fail:
     if (!*errp) {
-        *errp = local_errp;
+        *errp = local_err;
     }
 }
 
@@ -569,26 +572,27 @@ static void xilinx_axidma_init(Object *obj)
 {
     XilinxAXIDMA *s = XILINX_AXI_DMA(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
-    Error *errp = NULL;
 
     object_property_add_link(obj, "axistream-connected", TYPE_STREAM_SLAVE,
-                             (Object **) &s->tx_data_dev, &errp);
-    assert_no_error(errp);
+                             (Object **)&s->tx_data_dev,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
+                             &error_abort);
     object_property_add_link(obj, "axistream-control-connected",
                              TYPE_STREAM_SLAVE,
-                             (Object **) &s->tx_control_dev, &errp);
-    assert_no_error(errp);
+                             (Object **)&s->tx_control_dev,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
+                             &error_abort);
 
     object_initialize(&s->rx_data_dev, sizeof(s->rx_data_dev),
                       TYPE_XILINX_AXI_DMA_DATA_STREAM);
     object_initialize(&s->rx_control_dev, sizeof(s->rx_control_dev),
                       TYPE_XILINX_AXI_DMA_CONTROL_STREAM);
     object_property_add_child(OBJECT(s), "axistream-connected-target",
-                              (Object *)&s->rx_data_dev, &errp);
-    assert_no_error(errp);
+                              (Object *)&s->rx_data_dev, &error_abort);
     object_property_add_child(OBJECT(s), "axistream-control-connected-target",
-                              (Object *)&s->rx_control_dev, &errp);
-    assert_no_error(errp);
+                              (Object *)&s->rx_control_dev, &error_abort);
 
     sysbus_init_irq(sbd, &s->streams[0].irq);
     sysbus_init_irq(sbd, &s->streams[1].irq);

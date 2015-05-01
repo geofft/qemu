@@ -122,16 +122,11 @@ void cpu_asr_write(CPUUniCore32State *env1, target_ulong val, target_ulong mask)
 #define UC32_HWCAP_CMOV                 4 /* 1 << 2 */
 #define UC32_HWCAP_UCF64                8 /* 1 << 3 */
 
-#define cpu_init                        uc32_cpu_init
 #define cpu_exec                        uc32_cpu_exec
 #define cpu_signal_handler              uc32_cpu_signal_handler
-#define cpu_handle_mmu_fault            uc32_cpu_handle_mmu_fault
 
-CPUUniCore32State *uc32_cpu_init(const char *cpu_model);
 int uc32_cpu_exec(CPUUniCore32State *s);
 int uc32_cpu_signal_handler(int host_signum, void *pinfo, void *puc);
-int uc32_cpu_handle_mmu_fault(CPUUniCore32State *env, target_ulong address, int rw,
-                              int mmu_idx);
 
 /* MMU modes definitions */
 #define MMU_MODE0_SUFFIX _kernel
@@ -146,6 +141,10 @@ static inline int cpu_mmu_index(CPUUniCore32State *env)
 #include "cpu-qom.h"
 #include "exec/exec-all.h"
 
+UniCore32CPU *uc32_cpu_init(const char *cpu_model);
+
+#define cpu_init(cpu_model) CPU(uc32_cpu_init(cpu_model))
+
 static inline void cpu_get_tb_cpu_state(CPUUniCore32State *env, target_ulong *pc,
                                         target_ulong *cs_base, int *flags)
 {
@@ -157,13 +156,9 @@ static inline void cpu_get_tb_cpu_state(CPUUniCore32State *env, target_ulong *pc
     }
 }
 
+int uc32_cpu_handle_mmu_fault(CPUState *cpu, vaddr address, int rw,
+                              int mmu_idx);
 void uc32_translate_init(void);
 void switch_mode(CPUUniCore32State *, int);
-
-static inline bool cpu_has_work(CPUState *cpu)
-{
-    return cpu->interrupt_request &
-        (CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-}
 
 #endif /* QEMU_UNICORE32_CPU_H */

@@ -38,7 +38,7 @@
 #include "hw/loader.h"
 #include "hw/timer/mc146818rtc.h"
 #include "hw/isa/pc87312.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/arch_init.h"
 #include "sysemu/qtest.h"
 #include "exec/address-spaces.h"
@@ -181,10 +181,11 @@ static const MemoryRegionOps PPC_XCSR_ops = {
 /* Fake super-io ports for PREP platform (Intel 82378ZB) */
 typedef struct sysctrl_t {
     qemu_irq reset_irq;
-    M48t59State *nvram;
+    Nvram *nvram;
     uint8_t state;
     uint8_t syscontrol;
     int contiguous_map;
+    qemu_irq contiguous_map_irq;
     int endian;
 } sysctrl_t;
 
@@ -234,13 +235,17 @@ static void PREP_io_800_writeb (void *opaque, uint32_t addr, uint32_t val)
         break;
     case 0x0810:
         /* Password protect 1 register */
-        if (sysctrl->nvram != NULL)
-            m48t59_toggle_lock(sysctrl->nvram, 1);
+        if (sysctrl->nvram != NULL) {
+            NvramClass *k = NVRAM_GET_CLASS(sysctrl->nvram);
+            (k->toggle_lock)(sysctrl->nvram, 1);
+        }
         break;
     case 0x0812:
         /* Password protect 2 register */
-        if (sysctrl->nvram != NULL)
-            m48t59_toggle_lock(sysctrl->nvram, 2);
+        if (sysctrl->nvram != NULL) {
+            NvramClass *k = NVRAM_GET_CLASS(sysctrl->nvram);
+            (k->toggle_lock)(sysctrl->nvram, 2);
+        }
         break;
     case 0x0814:
         /* L2 invalidate register */
@@ -253,6 +258,7 @@ static void PREP_io_800_writeb (void *opaque, uint32_t addr, uint32_t val)
     case 0x0850:
         /* I/O map type register */
         sysctrl->contiguous_map = val & 0x01;
+        qemu_set_irq(sysctrl->contiguous_map_irq, sysctrl->contiguous_map);
         break;
     default:
         printf("ERROR: unaffected IO port write: %04" PRIx32
@@ -327,91 +333,6 @@ static uint32_t PREP_io_800_readb (void *opaque, uint32_t addr)
     return retval;
 }
 
-static inline hwaddr prep_IO_address(sysctrl_t *sysctrl,
-                                                 hwaddr addr)
-{
-    if (sysctrl->contiguous_map == 0) {
-        /* 64 KB contiguous space for IOs */
-        addr &= 0xFFFF;
-    } else {
-        /* 8 MB non-contiguous space for IOs */
-        addr = (addr & 0x1F) | ((addr & 0x007FFF000) >> 7);
-    }
-
-    return addr;
-}
-
-static void PPC_prep_io_writeb (void *opaque, hwaddr addr,
-                                uint32_t value)
-{
-    sysctrl_t *sysctrl = opaque;
-
-    addr = prep_IO_address(sysctrl, addr);
-    cpu_outb(addr, value);
-}
-
-static uint32_t PPC_prep_io_readb (void *opaque, hwaddr addr)
-{
-    sysctrl_t *sysctrl = opaque;
-    uint32_t ret;
-
-    addr = prep_IO_address(sysctrl, addr);
-    ret = cpu_inb(addr);
-
-    return ret;
-}
-
-static void PPC_prep_io_writew (void *opaque, hwaddr addr,
-                                uint32_t value)
-{
-    sysctrl_t *sysctrl = opaque;
-
-    addr = prep_IO_address(sysctrl, addr);
-    PPC_IO_DPRINTF("0x" TARGET_FMT_plx " => 0x%08" PRIx32 "\n", addr, value);
-    cpu_outw(addr, value);
-}
-
-static uint32_t PPC_prep_io_readw (void *opaque, hwaddr addr)
-{
-    sysctrl_t *sysctrl = opaque;
-    uint32_t ret;
-
-    addr = prep_IO_address(sysctrl, addr);
-    ret = cpu_inw(addr);
-    PPC_IO_DPRINTF("0x" TARGET_FMT_plx " <= 0x%08" PRIx32 "\n", addr, ret);
-
-    return ret;
-}
-
-static void PPC_prep_io_writel (void *opaque, hwaddr addr,
-                                uint32_t value)
-{
-    sysctrl_t *sysctrl = opaque;
-
-    addr = prep_IO_address(sysctrl, addr);
-    PPC_IO_DPRINTF("0x" TARGET_FMT_plx " => 0x%08" PRIx32 "\n", addr, value);
-    cpu_outl(addr, value);
-}
-
-static uint32_t PPC_prep_io_readl (void *opaque, hwaddr addr)
-{
-    sysctrl_t *sysctrl = opaque;
-    uint32_t ret;
-
-    addr = prep_IO_address(sysctrl, addr);
-    ret = cpu_inl(addr);
-    PPC_IO_DPRINTF("0x" TARGET_FMT_plx " <= 0x%08" PRIx32 "\n", addr, ret);
-
-    return ret;
-}
-
-static const MemoryRegionOps PPC_prep_io_ops = {
-    .old_mmio = {
-        .read = { PPC_prep_io_readb, PPC_prep_io_readw, PPC_prep_io_readl },
-        .write = { PPC_prep_io_writeb, PPC_prep_io_writew, PPC_prep_io_writel },
-    },
-    .endianness = DEVICE_NATIVE_ENDIAN,
-};
 
 #define NVRAM_SIZE        0x2000
 
@@ -429,9 +350,6 @@ static void ppc_prep_reset(void *opaque)
     PowerPCCPU *cpu = opaque;
 
     cpu_reset(CPU(cpu));
-
-    /* Reset address */
-    cpu->env.nip = 0xfffffffc;
 }
 
 static const MemoryRegionPortio prep_portio_list[] = {
@@ -444,29 +362,164 @@ static const MemoryRegionPortio prep_portio_list[] = {
     PORTIO_END_OF_LIST(),
 };
 
-/* PowerPC PREP hardware initialisation */
-static void ppc_prep_init(QEMUMachineInitArgs *args)
+static PortioList prep_port_list;
+
+/*****************************************************************************/
+/* NVRAM helpers */
+static inline uint32_t nvram_read(Nvram *nvram, uint32_t addr)
 {
-    ram_addr_t ram_size = args->ram_size;
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
-    const char *boot_device = args->boot_order;
+    NvramClass *k = NVRAM_GET_CLASS(sysctrl->nvram);
+    return (k->read)(nvram, addr);
+}
+
+static inline void nvram_write(Nvram *nvram, uint32_t addr, uint32_t val)
+{
+    NvramClass *k = NVRAM_GET_CLASS(sysctrl->nvram);
+    (k->write)(nvram, addr, val);
+}
+
+static void NVRAM_set_byte(Nvram *nvram, uint32_t addr, uint8_t value)
+{
+    nvram_write(nvram, addr, value);
+}
+
+static uint8_t NVRAM_get_byte(Nvram *nvram, uint32_t addr)
+{
+    return nvram_read(nvram, addr);
+}
+
+static void NVRAM_set_word(Nvram *nvram, uint32_t addr, uint16_t value)
+{
+    nvram_write(nvram, addr, value >> 8);
+    nvram_write(nvram, addr + 1, value & 0xFF);
+}
+
+static uint16_t NVRAM_get_word(Nvram *nvram, uint32_t addr)
+{
+    uint16_t tmp;
+
+    tmp = nvram_read(nvram, addr) << 8;
+    tmp |= nvram_read(nvram, addr + 1);
+
+    return tmp;
+}
+
+static void NVRAM_set_lword(Nvram *nvram, uint32_t addr, uint32_t value)
+{
+    nvram_write(nvram, addr, value >> 24);
+    nvram_write(nvram, addr + 1, (value >> 16) & 0xFF);
+    nvram_write(nvram, addr + 2, (value >> 8) & 0xFF);
+    nvram_write(nvram, addr + 3, value & 0xFF);
+}
+
+static void NVRAM_set_string(Nvram *nvram, uint32_t addr, const char *str,
+                             uint32_t max)
+{
+    int i;
+
+    for (i = 0; i < max && str[i] != '\0'; i++) {
+        nvram_write(nvram, addr + i, str[i]);
+    }
+    nvram_write(nvram, addr + i, str[i]);
+    nvram_write(nvram, addr + max - 1, '\0');
+}
+
+static uint16_t NVRAM_crc_update (uint16_t prev, uint16_t value)
+{
+    uint16_t tmp;
+    uint16_t pd, pd1, pd2;
+
+    tmp = prev >> 8;
+    pd = prev ^ value;
+    pd1 = pd & 0x000F;
+    pd2 = ((pd >> 4) & 0x000F) ^ pd1;
+    tmp ^= (pd1 << 3) | (pd1 << 8);
+    tmp ^= pd2 | (pd2 << 7) | (pd2 << 12);
+
+    return tmp;
+}
+
+static uint16_t NVRAM_compute_crc (Nvram *nvram, uint32_t start, uint32_t count)
+{
+    uint32_t i;
+    uint16_t crc = 0xFFFF;
+    int odd;
+
+    odd = count & 1;
+    count &= ~1;
+    for (i = 0; i != count; i++) {
+        crc = NVRAM_crc_update(crc, NVRAM_get_word(nvram, start + i));
+    }
+    if (odd) {
+        crc = NVRAM_crc_update(crc, NVRAM_get_byte(nvram, start + i) << 8);
+    }
+
+    return crc;
+}
+
+#define CMDLINE_ADDR 0x017ff000
+
+static int PPC_NVRAM_set_params (Nvram *nvram, uint16_t NVRAM_size,
+                          const char *arch,
+                          uint32_t RAM_size, int boot_device,
+                          uint32_t kernel_image, uint32_t kernel_size,
+                          const char *cmdline,
+                          uint32_t initrd_image, uint32_t initrd_size,
+                          uint32_t NVRAM_image,
+                          int width, int height, int depth)
+{
+    uint16_t crc;
+
+    /* Set parameters for Open Hack'Ware BIOS */
+    NVRAM_set_string(nvram, 0x00, "QEMU_BIOS", 16);
+    NVRAM_set_lword(nvram,  0x10, 0x00000002); /* structure v2 */
+    NVRAM_set_word(nvram,   0x14, NVRAM_size);
+    NVRAM_set_string(nvram, 0x20, arch, 16);
+    NVRAM_set_lword(nvram,  0x30, RAM_size);
+    NVRAM_set_byte(nvram,   0x34, boot_device);
+    NVRAM_set_lword(nvram,  0x38, kernel_image);
+    NVRAM_set_lword(nvram,  0x3C, kernel_size);
+    if (cmdline) {
+        /* XXX: put the cmdline in NVRAM too ? */
+        pstrcpy_targphys("cmdline", CMDLINE_ADDR, RAM_size - CMDLINE_ADDR,
+                         cmdline);
+        NVRAM_set_lword(nvram,  0x40, CMDLINE_ADDR);
+        NVRAM_set_lword(nvram,  0x44, strlen(cmdline));
+    } else {
+        NVRAM_set_lword(nvram,  0x40, 0);
+        NVRAM_set_lword(nvram,  0x44, 0);
+    }
+    NVRAM_set_lword(nvram,  0x48, initrd_image);
+    NVRAM_set_lword(nvram,  0x4C, initrd_size);
+    NVRAM_set_lword(nvram,  0x50, NVRAM_image);
+
+    NVRAM_set_word(nvram,   0x54, width);
+    NVRAM_set_word(nvram,   0x56, height);
+    NVRAM_set_word(nvram,   0x58, depth);
+    crc = NVRAM_compute_crc(nvram, 0x00, 0xF8);
+    NVRAM_set_word(nvram,   0xFC, crc);
+
+    return 0;
+}
+
+/* PowerPC PREP hardware initialisation */
+static void ppc_prep_init(MachineState *machine)
+{
+    ram_addr_t ram_size = machine->ram_size;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
+    const char *boot_device = machine->boot_order;
     MemoryRegion *sysmem = get_system_memory();
     PowerPCCPU *cpu = NULL;
     CPUPPCState *env = NULL;
-    char *filename;
-    nvram_t nvram;
-    M48t59State *m48t59;
-    MemoryRegion *PPC_io_memory = g_new(MemoryRegion, 1);
-    PortioList *port_list = g_new(PortioList, 1);
+    Nvram *m48t59;
 #if 0
     MemoryRegion *xcsr = g_new(MemoryRegion, 1);
 #endif
-    int linux_boot, i, nb_nics1, bios_size;
+    int linux_boot, i, nb_nics1;
     MemoryRegion *ram = g_new(MemoryRegion, 1);
-    MemoryRegion *bios = g_new(MemoryRegion, 1);
     uint32_t kernel_base, initrd_base;
     long kernel_size, initrd_size;
     DeviceState *dev;
@@ -505,46 +558,8 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
     }
 
     /* allocate RAM */
-    memory_region_init_ram(ram, NULL, "ppc_prep.ram", ram_size);
-    vmstate_register_ram_global(ram);
+    memory_region_allocate_system_memory(ram, NULL, "ppc_prep.ram", ram_size);
     memory_region_add_subregion(sysmem, 0, ram);
-
-    /* allocate and load BIOS */
-    memory_region_init_ram(bios, NULL, "ppc_prep.bios", BIOS_SIZE);
-    memory_region_set_readonly(bios, true);
-    memory_region_add_subregion(sysmem, (uint32_t)(-BIOS_SIZE), bios);
-    vmstate_register_ram_global(bios);
-    if (bios_name == NULL)
-        bios_name = BIOS_FILENAME;
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
-    if (filename) {
-        bios_size = load_elf(filename, NULL, NULL, NULL,
-                             NULL, NULL, 1, ELF_MACHINE, 0);
-        if (bios_size < 0) {
-            bios_size = get_image_size(filename);
-            if (bios_size > 0 && bios_size <= BIOS_SIZE) {
-                hwaddr bios_addr;
-                bios_size = (bios_size + 0xfff) & ~0xfff;
-                bios_addr = (uint32_t)(-bios_size);
-                bios_size = load_image_targphys(filename, bios_addr, bios_size);
-            }
-            if (bios_size > BIOS_SIZE) {
-                fprintf(stderr, "qemu: PReP bios '%s' is too large (0x%x)\n",
-                        bios_name, bios_size);
-                exit(1);
-            }
-        }
-    } else {
-        bios_size = -1;
-    }
-    if (bios_size < 0 && !qtest_enabled()) {
-        fprintf(stderr, "qemu: could not load PPC PReP bios '%s'\n",
-                bios_name);
-        exit(1);
-    }
-    if (filename) {
-        g_free(filename);
-    }
 
     if (linux_boot) {
         kernel_base = KERNEL_LOAD_ADDR;
@@ -593,6 +608,11 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
     }
 
     dev = qdev_create(NULL, "raven-pcihost");
+    if (bios_name == NULL) {
+        bios_name = BIOS_FILENAME;
+    }
+    qdev_prop_set_string(dev, "bios-name", bios_name);
+    qdev_prop_set_uint32(dev, "elf-machine", ELF_MACHINE);
     pcihost = PCI_HOST_BRIDGE(dev);
     object_property_add_child(qdev_get_machine(), "raven", OBJECT(dev), NULL);
     qdev_init_nofail(dev);
@@ -601,6 +621,7 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
         fprintf(stderr, "Couldn't create PCI host controller.\n");
         exit(1);
     }
+    sysctrl->contiguous_map_irq = qdev_get_gpio_in(dev, 0);
 
     /* PCI -> ISA bridge */
     pci = pci_create_simple(pci_bus, PCI_DEVFN(1, 0), "i82378");
@@ -621,11 +642,6 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
     qdev_prop_set_uint8(dev, "config", 13); /* fdc, ser0, ser1, par0 */
     qdev_init_nofail(dev);
 
-    /* Register 8 MB of ISA IO space (needed for non-contiguous map) */
-    memory_region_init_io(PPC_io_memory, NULL, &PPC_prep_io_ops, sysctrl,
-                          "ppc-io", 0x00800000);
-    memory_region_add_subregion(sysmem, 0x80000000, PPC_io_memory);
-
     /* init basic PC hardware */
     pci_vga_init(pci_bus);
 
@@ -644,7 +660,7 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
         }
     }
 
-    ide_drive_get(hd, MAX_IDE_BUS);
+    ide_drive_get(hd, ARRAY_SIZE(hd));
     for(i = 0; i < MAX_IDE_BUS; i++) {
         isa_ide_init(isa_bus, ide_iobase[i], ide_iobase2[i], ide_irq[i],
                      hd[2 * i],
@@ -655,8 +671,8 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
     cpu = POWERPC_CPU(first_cpu);
     sysctrl->reset_irq = cpu->env.irq_inputs[PPC6xx_INPUT_HRESET];
 
-    portio_list_init(port_list, NULL, prep_portio_list, sysctrl, "prep");
-    portio_list_add(port_list, get_system_io(), 0x0);
+    portio_list_init(&prep_port_list, NULL, prep_portio_list, sysctrl, "prep");
+    portio_list_add(&prep_port_list, isa_address_space_io(isa), 0x0);
 
     /* PowerPC control and status register group */
 #if 0
@@ -664,20 +680,18 @@ static void ppc_prep_init(QEMUMachineInitArgs *args)
     memory_region_add_subregion(sysmem, 0xFEFF0000, xcsr);
 #endif
 
-    if (usb_enabled(false)) {
+    if (usb_enabled()) {
         pci_create_simple(pci_bus, -1, "pci-ohci");
     }
 
-    m48t59 = m48t59_init_isa(isa_bus, 0x0074, NVRAM_SIZE, 59);
+    m48t59 = m48t59_init_isa(isa_bus, 0x0074, NVRAM_SIZE, 2000, 59);
     if (m48t59 == NULL)
         return;
     sysctrl->nvram = m48t59;
 
     /* Initialise NVRAM */
-    nvram.opaque = m48t59;
-    nvram.read_fn = &m48t59_read;
-    nvram.write_fn = &m48t59_write;
-    PPC_NVRAM_set_params(&nvram, NVRAM_SIZE, "PREP", ram_size, ppc_boot_device,
+    PPC_NVRAM_set_params(m48t59, NVRAM_SIZE, "PREP", ram_size,
+                         ppc_boot_device,
                          kernel_base, kernel_size,
                          kernel_cmdline,
                          initrd_base, initrd_size,

@@ -43,7 +43,7 @@ struct LM32PicState {
 typedef struct LM32PicState LM32PicState;
 
 static LM32PicState *pic;
-void lm32_do_pic_info(Monitor *mon, const QDict *qdict)
+void lm32_hmp_info_pic(Monitor *mon, const QDict *qdict)
 {
     if (pic == NULL) {
         return;
@@ -53,7 +53,7 @@ void lm32_do_pic_info(Monitor *mon, const QDict *qdict)
             pic->im, pic->ip, pic->irq_state);
 }
 
-void lm32_irq_info(Monitor *mon, const QDict *qdict)
+void lm32_hmp_info_irq(Monitor *mon, const QDict *qdict)
 {
     int i;
     uint32_t count;
@@ -169,8 +169,7 @@ static const VMStateDescription vmstate_lm32_pic = {
     .name = "lm32-pic",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(im, LM32PicState),
         VMSTATE_UINT32(ip, LM32PicState),
         VMSTATE_UINT32(irq_state, LM32PicState),

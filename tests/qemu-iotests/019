@@ -45,8 +45,11 @@ trap "_cleanup; exit \$status" 0 1 2 3 15
 
 # Any format supporting backing files
 _supported_fmt qcow qcow2 vmdk qed
-_supported_proto generic
+_supported_proto file
 _supported_os Linux
+_unsupported_imgopts "subformat=monolithicFlat" \
+                     "subformat=twoGbMaxExtentFlat" \
+                     "subformat=twoGbMaxExtentSparse"
 
 TEST_OFFSETS="0 4294967296"
 CLUSTER_SIZE=65536
@@ -93,7 +96,7 @@ mv "$TEST_IMG" "$TEST_IMG.orig"
 for backing_option in "-B " "-o backing_file="; do
 
     echo
-    echo Testing conversion with $backing_option$TEST_IMG.base | _filter_testdir | _filter_imgfmt
+    echo Testing conversion with $backing_option"$TEST_IMG.base" | _filter_testdir | _filter_imgfmt
     echo
     $QEMU_IMG convert -O $IMGFMT $backing_option"$TEST_IMG.base" "$TEST_IMG.orig" "$TEST_IMG"
 

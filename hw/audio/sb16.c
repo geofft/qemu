@@ -928,7 +928,7 @@ static IO_WRITE_PROTO (dsp_write)
 /*         if (s->highspeed) */
 /*             break; */
 
-        if (0 == s->needed_bytes) {
+        if (s->needed_bytes == 0) {
             command (s, val);
 #if 0
             if (0 == s->needed_bytes) {
@@ -999,7 +999,7 @@ static IO_READ_PROTO (dsp_read)
         retval = (!s->out_data_len || s->highspeed) ? 0 : 0x80;
         if (s->mixer_regs[0x82] & 1) {
             ack = 1;
-            s->mixer_regs[0x82] &= 1;
+            s->mixer_regs[0x82] &= ~1;
             qemu_irq_lower (s->pic);
         }
         break;
@@ -1008,7 +1008,7 @@ static IO_READ_PROTO (dsp_read)
         retval = 0xff;
         if (s->mixer_regs[0x82] & 2) {
             ack = 1;
-            s->mixer_regs[0x82] &= 2;
+            s->mixer_regs[0x82] &= ~2;
             qemu_irq_lower (s->pic);
         }
         break;
@@ -1212,7 +1212,7 @@ static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 #endif
 
     if (till <= copy) {
-        if (0 == s->dma_auto) {
+        if (s->dma_auto == 0) {
             copy = till;
         }
     }
@@ -1224,7 +1224,7 @@ static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
     if (s->left_till_irq <= 0) {
         s->mixer_regs[0x82] |= (nchan & 4) ? 2 : 1;
         qemu_irq_raise (s->pic);
-        if (0 == s->dma_auto) {
+        if (s->dma_auto == 0) {
             control (s, 0);
             speaker (s, 0);
         }
@@ -1289,9 +1289,8 @@ static const VMStateDescription vmstate_sb16 = {
     .name = "sb16",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = sb16_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32 (irq, SB16State),
         VMSTATE_UINT32 (dma, SB16State),
         VMSTATE_UINT32 (hdma, SB16State),
@@ -1399,8 +1398,8 @@ static int SB16_init (ISABus *bus)
 }
 
 static Property sb16_properties[] = {
-    DEFINE_PROP_HEX32  ("version", SB16State, ver,  0x0405), /* 4.5 */
-    DEFINE_PROP_HEX32  ("iobase",  SB16State, port, 0x220),
+    DEFINE_PROP_UINT32 ("version", SB16State, ver,  0x0405), /* 4.5 */
+    DEFINE_PROP_UINT32 ("iobase",  SB16State, port, 0x220),
     DEFINE_PROP_UINT32 ("irq",     SB16State, irq,  5),
     DEFINE_PROP_UINT32 ("dma",     SB16State, dma,  1),
     DEFINE_PROP_UINT32 ("dma16",   SB16State, hdma, 5),

@@ -36,7 +36,7 @@
 #include "hw/loader.h"
 #include "hw/usb.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
 
 #define FLASH_BASE 0x00000000
@@ -219,12 +219,12 @@ static struct QEMU_PACKED
     char kernel_cmdline[256];
 } boot_params;
 
-static void r2d_init(QEMUMachineInitArgs *args)
+static void r2d_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     SuperHCPU *cpu;
     CPUSH4State *env;
     ResetData *reset_info;
@@ -255,7 +255,7 @@ static void r2d_init(QEMUMachineInitArgs *args)
     qemu_register_reset(main_cpu_reset, reset_info);
 
     /* Allocate memory space */
-    memory_region_init_ram(sdram, NULL, "r2d.sdram", SDRAM_SIZE);
+    memory_region_init_ram(sdram, NULL, "r2d.sdram", SDRAM_SIZE, &error_abort);
     vmstate_register_ram_global(sdram);
     memory_region_add_subregion(address_space_mem, SDRAM_BASE, sdram);
     /* Register peripherals */
@@ -290,8 +290,8 @@ static void r2d_init(QEMUMachineInitArgs *args)
     /* onboard flash memory */
     dinfo = drive_get(IF_PFLASH, 0, 0);
     pflash_cfi02_register(0x0, NULL, "r2d.flash", FLASH_SIZE,
-                          dinfo ? dinfo->bdrv : NULL, (16 * 1024),
-                          FLASH_SIZE >> 16,
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          (16 * 1024), FLASH_SIZE >> 16,
                           1, 4, 0x0000, 0x0000, 0x0000, 0x0000,
                           0x555, 0x2aa, 0);
 
@@ -301,7 +301,7 @@ static void r2d_init(QEMUMachineInitArgs *args)
                             "rtl8139", i==0 ? "2" : NULL);
 
     /* USB keyboard */
-    usbdevice_create("keyboard");
+    usb_create_simple(usb_bus_find(-1), "usb-kbd");
 
     /* Todo: register on board registers */
     memset(&boot_params, 0, sizeof(boot_params));
@@ -318,8 +318,8 @@ static void r2d_init(QEMUMachineInitArgs *args)
         }
 
         /* initialization which should be done by firmware */
-        stl_phys(SH7750_BCR1, 1<<3); /* cs3 SDRAM */
-        stw_phys(SH7750_BCR2, 3<<(3*2)); /* cs3 32bit */
+        stl_phys(&address_space_memory, SH7750_BCR1, 1<<3); /* cs3 SDRAM */
+        stw_phys(&address_space_memory, SH7750_BCR2, 3<<(3*2)); /* cs3 32bit */
         reset_info->vector = (SDRAM_BASE + LINUX_LOAD_OFFSET) | 0xa0000000; /* Start from P2 area */
     }
 

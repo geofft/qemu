@@ -22,7 +22,7 @@
 #include "sysemu/sysemu.h"
 #include "hw/boards.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "hw/loader.h"
 #include "hw/ssi.h"
 #include "qemu/error-report.h"
@@ -37,6 +37,7 @@
 #define IRQ_OFFSET 32 /* pic interrupts start from index 32 */
 
 #define MPCORE_PERIPHBASE 0xF8F00000
+#define ZYNQ_BOARD_MIDR 0x413FC090
 
 static const int dma_irqs[8] = {
     46, 47, 48, 49, 72, 73, 74, 75
@@ -49,9 +50,11 @@ static void gem_init(NICInfo *nd, uint32_t base, qemu_irq irq)
     DeviceState *dev;
     SysBusDevice *s;
 
-    qemu_check_nic_model(nd, "cadence_gem");
     dev = qdev_create(NULL, "cadence_gem");
-    qdev_set_nic_properties(dev, nd);
+    if (nd->used) {
+        qemu_check_nic_model(nd, "cadence_gem");
+        qdev_set_nic_properties(dev, nd);
+    }
     qdev_init_nofail(dev);
     s = SYS_BUS_DEVICE(dev);
     sysbus_mmio_map(s, 0, base);
@@ -91,20 +94,20 @@ static inline void zynq_init_spi_flashes(uint32_t base_addr, qemu_irq irq,
         for (j = 0; j < num_ss; ++j) {
             flash_dev = ssi_create_slave(spi, "n25q128");
 
-            cs_line = qdev_get_gpio_in(flash_dev, 0);
+            cs_line = qdev_get_gpio_in_named(flash_dev, SSI_GPIO_CS, 0);
             sysbus_connect_irq(busdev, i * num_ss + j + 1, cs_line);
         }
     }
 
 }
 
-static void zynq_init(QEMUMachineInitArgs *args)
+static void zynq_init(MachineState *machine)
 {
-    ram_addr_t ram_size = args->ram_size;
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    ram_addr_t ram_size = machine->ram_size;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     ObjectClass *cpu_oc;
     ARMCPU *cpu;
     MemoryRegion *address_space_mem = get_system_memory();
@@ -113,7 +116,6 @@ static void zynq_init(QEMUMachineInitArgs *args)
     DeviceState *dev;
     SysBusDevice *busdev;
     qemu_irq pic[64];
-    NICInfo *nd;
     Error *err = NULL;
     int n;
 
@@ -124,14 +126,32 @@ static void zynq_init(QEMUMachineInitArgs *args)
 
     cpu = ARM_CPU(object_new(object_class_get_name(cpu_oc)));
 
+    /* By default A9 CPUs have EL3 enabled.  This board does not
+     * currently support EL3 so the CPU EL3 property is disabled before
+     * realization.
+     */
+    if (object_property_find(OBJECT(cpu), "has_el3", NULL)) {
+        object_property_set_bool(OBJECT(cpu), false, "has_el3", &err);
+        if (err) {
+            error_report_err(err);
+            exit(1);
+        }
+    }
+
+    object_property_set_int(OBJECT(cpu), ZYNQ_BOARD_MIDR, "midr", &err);
+    if (err) {
+        error_report_err(err);
+        exit(1);
+    }
+
     object_property_set_int(OBJECT(cpu), MPCORE_PERIPHBASE, "reset-cbar", &err);
     if (err) {
-        error_report("%s", error_get_pretty(err));
+        error_report_err(err);
         exit(1);
     }
     object_property_set_bool(OBJECT(cpu), true, "realized", &err);
     if (err) {
-        error_report("%s", error_get_pretty(err));
+        error_report_err(err);
         exit(1);
     }
 
@@ -141,12 +161,13 @@ static void zynq_init(QEMUMachineInitArgs *args)
     }
 
     /* DDR remapped to address zero.  */
-    memory_region_init_ram(ext_ram, NULL, "zynq.ext_ram", ram_size);
-    vmstate_register_ram_global(ext_ram);
+    memory_region_allocate_system_memory(ext_ram, NULL, "zynq.ext_ram",
+                                         ram_size);
     memory_region_add_subregion(address_space_mem, 0, ext_ram);
 
     /* 256K of on-chip memory */
-    memory_region_init_ram(ocm_ram, NULL, "zynq.ocm_ram", 256 << 10);
+    memory_region_init_ram(ocm_ram, NULL, "zynq.ocm_ram", 256 << 10,
+                           &error_abort);
     vmstate_register_ram_global(ocm_ram);
     memory_region_add_subregion(address_space_mem, 0xFFFC0000, ocm_ram);
 
@@ -154,7 +175,8 @@ static void zynq_init(QEMUMachineInitArgs *args)
 
     /* AMD */
     pflash_cfi02_register(0xe2000000, NULL, "zynq.pflash", FLASH_SIZE,
-                          dinfo ? dinfo->bdrv : NULL, FLASH_SECTOR_SIZE,
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          FLASH_SECTOR_SIZE,
                           FLASH_SIZE/FLASH_SECTOR_SIZE, 1,
                           1, 0x0066, 0x0022, 0x0000, 0x0000, 0x0555, 0x2aa,
                               0);
@@ -190,14 +212,8 @@ static void zynq_init(QEMUMachineInitArgs *args)
     sysbus_create_varargs("cadence_ttc", 0xF8002000,
             pic[69-IRQ_OFFSET], pic[70-IRQ_OFFSET], pic[71-IRQ_OFFSET], NULL);
 
-    for (n = 0; n < nb_nics; n++) {
-        nd = &nd_table[n];
-        if (n == 0) {
-            gem_init(nd, 0xE000B000, pic[54-IRQ_OFFSET]);
-        } else if (n == 1) {
-            gem_init(nd, 0xE000C000, pic[77-IRQ_OFFSET]);
-        }
-    }
+    gem_init(&nd_table[0], 0xE000B000, pic[54-IRQ_OFFSET]);
+    gem_init(&nd_table[1], 0xE000C000, pic[77-IRQ_OFFSET]);
 
     dev = qdev_create(NULL, "generic-sdhci");
     qdev_init_nofail(dev);

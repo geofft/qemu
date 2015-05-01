@@ -28,11 +28,12 @@
 #include "hw/block/flash.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/qtest.h"
-#include "block/block.h"
+#include "sysemu/block-backend.h"
 #include "hw/boards.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "hw/loader.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "exec/address-spaces.h"
 
@@ -172,12 +173,12 @@ static void ref405ep_fpga_init(MemoryRegion *sysmem, uint32_t base)
     qemu_register_reset(&ref405ep_fpga_reset, fpga);
 }
 
-static void ref405ep_init(QEMUMachineInitArgs *args)
+static void ref405ep_init(MachineState *machine)
 {
-    ram_addr_t ram_size = args->ram_size;
-    const char *kernel_filename = args->kernel_filename;
-    const char *kernel_cmdline = args->kernel_cmdline;
-    const char *initrd_filename = args->initrd_filename;
+    ram_addr_t ram_size = machine->ram_size;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *kernel_cmdline = machine->kernel_cmdline;
+    const char *initrd_filename = machine->initrd_filename;
     char *filename;
     ppc4xx_bd_info_t bd;
     CPUPPCState *env;
@@ -199,8 +200,8 @@ static void ref405ep_init(QEMUMachineInitArgs *args)
     MemoryRegion *sysmem = get_system_memory();
 
     /* XXX: fix this */
-    memory_region_init_ram(&ram_memories[0], NULL, "ef405ep.ram", 0x08000000);
-    vmstate_register_ram_global(&ram_memories[0]);
+    memory_region_allocate_system_memory(&ram_memories[0], NULL, "ef405ep.ram",
+                                         0x08000000);
     ram_bases[0] = 0;
     ram_sizes[0] = 0x08000000;
     memory_region_init(&ram_memories[1], NULL, "ef405ep.ram1", 0);
@@ -214,7 +215,7 @@ static void ref405ep_init(QEMUMachineInitArgs *args)
                         33333333, &pic, kernel_filename == NULL ? 0 : 1);
     /* allocate SRAM */
     sram_size = 512 * 1024;
-    memory_region_init_ram(sram, NULL, "ef405ep.sram", sram_size);
+    memory_region_init_ram(sram, NULL, "ef405ep.sram", sram_size, &error_abort);
     vmstate_register_ram_global(sram);
     memory_region_add_subregion(sysmem, 0xFFF00000, sram);
     /* allocate and load BIOS */
@@ -225,17 +226,19 @@ static void ref405ep_init(QEMUMachineInitArgs *args)
 #ifdef USE_FLASH_BIOS
     dinfo = drive_get(IF_PFLASH, 0, fl_idx);
     if (dinfo) {
-        bios_size = bdrv_getlength(dinfo->bdrv);
+        BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
+
+        bios_size = blk_getlength(blk);
         fl_sectors = (bios_size + 65535) >> 16;
 #ifdef DEBUG_BOARD_INIT
         printf("Register parallel flash %d size %lx"
                " at addr %lx '%s' %d\n",
                fl_idx, bios_size, -bios_size,
-               bdrv_get_device_name(dinfo->bdrv), fl_sectors);
+               blk_name(blk), fl_sectors);
 #endif
         pflash_cfi02_register((uint32_t)(-bios_size),
                               NULL, "ef405ep.bios", bios_size,
-                              dinfo->bdrv, 65536, fl_sectors, 1,
+                              blk, 65536, fl_sectors, 1,
                               2, 0x0001, 0x22DA, 0x0000, 0x0000, 0x555, 0x2AA,
                               1);
         fl_idx++;
@@ -246,8 +249,10 @@ static void ref405ep_init(QEMUMachineInitArgs *args)
         printf("Load BIOS from file\n");
 #endif
         bios = g_new(MemoryRegion, 1);
-        memory_region_init_ram(bios, NULL, "ef405ep.bios", BIOS_SIZE);
+        memory_region_init_ram(bios, NULL, "ef405ep.bios", BIOS_SIZE,
+                               &error_abort);
         vmstate_register_ram_global(bios);
+
         if (bios_name == NULL)
             bios_name = BIOS_FILENAME;
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
@@ -278,7 +283,7 @@ static void ref405ep_init(QEMUMachineInitArgs *args)
 #ifdef DEBUG_BOARD_INIT
     printf("%s: register NVRAM\n", __func__);
 #endif
-    m48t59_init(NULL, 0xF0000000, 0, 8192, 8);
+    m48t59_init(NULL, 0xF0000000, 0, 8192, 1968, 8);
     /* Load kernel */
     linux_boot = (kernel_filename != NULL);
     if (linux_boot) {
@@ -499,16 +504,17 @@ static void taihu_cpld_init(MemoryRegion *sysmem, uint32_t base)
     qemu_register_reset(&taihu_cpld_reset, cpld);
 }
 
-static void taihu_405ep_init(QEMUMachineInitArgs *args)
+static void taihu_405ep_init(MachineState *machine)
 {
-    ram_addr_t ram_size = args->ram_size;
-    const char *kernel_filename = args->kernel_filename;
-    const char *initrd_filename = args->initrd_filename;
+    ram_addr_t ram_size = machine->ram_size;
+    const char *kernel_filename = machine->kernel_filename;
+    const char *initrd_filename = machine->initrd_filename;
     char *filename;
     qemu_irq *pic;
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *bios;
     MemoryRegion *ram_memories = g_malloc(2 * sizeof(*ram_memories));
+    MemoryRegion *ram = g_malloc0(sizeof(*ram));
     hwaddr ram_bases[2], ram_sizes[2];
     long bios_size;
     target_ulong kernel_base, initrd_base;
@@ -518,17 +524,20 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
     DriveInfo *dinfo;
 
     /* RAM is soldered to the board so the size cannot be changed */
-    memory_region_init_ram(&ram_memories[0], NULL,
-                           "taihu_405ep.ram-0", 0x04000000);
-    vmstate_register_ram_global(&ram_memories[0]);
+    ram_size = 0x08000000;
+    memory_region_allocate_system_memory(ram, NULL, "taihu_405ep.ram",
+                                         ram_size);
+
     ram_bases[0] = 0;
     ram_sizes[0] = 0x04000000;
-    memory_region_init_ram(&ram_memories[1], NULL,
-                           "taihu_405ep.ram-1", 0x04000000);
-    vmstate_register_ram_global(&ram_memories[1]);
+    memory_region_init_alias(&ram_memories[0], NULL,
+                             "taihu_405ep.ram-0", ram, ram_bases[0],
+                             ram_sizes[0]);
     ram_bases[1] = 0x04000000;
     ram_sizes[1] = 0x04000000;
-    ram_size = 0x08000000;
+    memory_region_init_alias(&ram_memories[1], NULL,
+                             "taihu_405ep.ram-1", ram, ram_bases[1],
+                             ram_sizes[1]);
 #ifdef DEBUG_BOARD_INIT
     printf("%s: register cpu\n", __func__);
 #endif
@@ -542,7 +551,9 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
 #if defined(USE_FLASH_BIOS)
     dinfo = drive_get(IF_PFLASH, 0, fl_idx);
     if (dinfo) {
-        bios_size = bdrv_getlength(dinfo->bdrv);
+        BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
+
+        bios_size = blk_getlength(blk);
         /* XXX: should check that size is 2MB */
         //        bios_size = 2 * 1024 * 1024;
         fl_sectors = (bios_size + 65535) >> 16;
@@ -550,11 +561,11 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
         printf("Register parallel flash %d size %lx"
                " at addr %lx '%s' %d\n",
                fl_idx, bios_size, -bios_size,
-               bdrv_get_device_name(dinfo->bdrv), fl_sectors);
+               blk_name(blk), fl_sectors);
 #endif
         pflash_cfi02_register((uint32_t)(-bios_size),
                               NULL, "taihu_405ep.bios", bios_size,
-                              dinfo->bdrv, 65536, fl_sectors, 1,
+                              blk, 65536, fl_sectors, 1,
                               4, 0x0001, 0x22DA, 0x0000, 0x0000, 0x555, 0x2AA,
                               1);
         fl_idx++;
@@ -567,7 +578,8 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
         if (bios_name == NULL)
             bios_name = BIOS_FILENAME;
         bios = g_new(MemoryRegion, 1);
-        memory_region_init_ram(bios, NULL, "taihu_405ep.bios", BIOS_SIZE);
+        memory_region_init_ram(bios, NULL, "taihu_405ep.bios", BIOS_SIZE,
+                               &error_abort);
         vmstate_register_ram_global(bios);
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
         if (filename) {
@@ -588,7 +600,9 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
     /* Register Linux flash */
     dinfo = drive_get(IF_PFLASH, 0, fl_idx);
     if (dinfo) {
-        bios_size = bdrv_getlength(dinfo->bdrv);
+        BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
+
+        bios_size = blk_getlength(blk);
         /* XXX: should check that size is 32MB */
         bios_size = 32 * 1024 * 1024;
         fl_sectors = (bios_size + 65535) >> 16;
@@ -596,10 +610,10 @@ static void taihu_405ep_init(QEMUMachineInitArgs *args)
         printf("Register parallel flash %d size %lx"
                " at addr " TARGET_FMT_lx " '%s'\n",
                fl_idx, bios_size, (target_ulong)0xfc000000,
-               bdrv_get_device_name(dinfo->bdrv));
+               blk_name(blk));
 #endif
         pflash_cfi02_register(0xfc000000, NULL, "taihu_405ep.flash", bios_size,
-                              dinfo->bdrv, 65536, fl_sectors, 1,
+                              blk, 65536, fl_sectors, 1,
                               4, 0x0001, 0x22DA, 0x0000, 0x0000, 0x555, 0x2AA,
                               1);
         fl_idx++;

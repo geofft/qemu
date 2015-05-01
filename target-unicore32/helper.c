@@ -11,7 +11,7 @@
 
 #include "cpu.h"
 #include "exec/gdbstub.h"
-#include "helper.h"
+#include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
 #ifndef CONFIG_USER_ONLY
 #include "ui/console.h"
@@ -25,22 +25,9 @@
 #define DPRINTF(fmt, ...) do {} while (0)
 #endif
 
-CPUUniCore32State *uc32_cpu_init(const char *cpu_model)
+UniCore32CPU *uc32_cpu_init(const char *cpu_model)
 {
-    UniCore32CPU *cpu;
-    CPUUniCore32State *env;
-    ObjectClass *oc;
-
-    oc = cpu_class_by_name(TYPE_UNICORE32_CPU, cpu_model);
-    if (oc == NULL) {
-        return NULL;
-    }
-    cpu = UNICORE32_CPU(object_new(object_class_get_name(oc)));
-    env = &cpu->env;
-
-    object_property_set_bool(OBJECT(cpu), true, "realized", NULL);
-
-    return env;
+    return UNICORE32_CPU(cpu_generic_init(TYPE_UNICORE32_CPU, cpu_model));
 }
 
 uint32_t HELPER(clo)(uint32_t x)
@@ -57,6 +44,8 @@ uint32_t HELPER(clz)(uint32_t x)
 void helper_cp0_set(CPUUniCore32State *env, uint32_t val, uint32_t creg,
         uint32_t cop)
 {
+    UniCore32CPU *cpu = uc32_env_get_cpu(env);
+
     /*
      * movc pp.nn, rn, #imm9
      *      rn: UCOP_REG_D
@@ -125,7 +114,7 @@ void helper_cp0_set(CPUUniCore32State *env, uint32_t val, uint32_t creg,
     case 6:
         if ((cop <= 6) && (cop >= 2)) {
             /* invalid all tlb */
-            tlb_flush(env, 1);
+            tlb_flush(CPU(cpu), 1);
             return;
         }
         break;
@@ -236,23 +225,37 @@ void helper_cp1_putc(target_ulong x)
 #ifdef CONFIG_USER_ONLY
 void switch_mode(CPUUniCore32State *env, int mode)
 {
+    UniCore32CPU *cpu = uc32_env_get_cpu(env);
+
     if (mode != ASR_MODE_USER) {
-        cpu_abort(env, "Tried to switch out of user mode\n");
+        cpu_abort(CPU(cpu), "Tried to switch out of user mode\n");
     }
 }
 
 void uc32_cpu_do_interrupt(CPUState *cs)
 {
-    UniCore32CPU *cpu = UNICORE32_CPU(cs);
-    CPUUniCore32State *env = &cpu->env;
-
-    cpu_abort(env, "NO interrupt in user mode\n");
+    cpu_abort(cs, "NO interrupt in user mode\n");
 }
 
-int uc32_cpu_handle_mmu_fault(CPUUniCore32State *env, target_ulong address,
+int uc32_cpu_handle_mmu_fault(CPUState *cs, vaddr address,
                               int access_type, int mmu_idx)
 {
-    cpu_abort(env, "NO mmu fault in user mode\n");
+    cpu_abort(cs, "NO mmu fault in user mode\n");
     return 1;
 }
 #endif
+
+bool uc32_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+{
+    if (interrupt_request & CPU_INTERRUPT_HARD) {
+        UniCore32CPU *cpu = UNICORE32_CPU(cs);
+        CPUUniCore32State *env = &cpu->env;
+
+        if (!(env->uncached_asr & ASR_I)) {
+            cs->exception_index = UC32_EXCP_INTR;
+            uc32_cpu_do_interrupt(cs);
+            return true;
+        }
+    }
+    return false;
+}

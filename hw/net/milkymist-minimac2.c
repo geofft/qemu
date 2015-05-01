@@ -425,13 +425,6 @@ static int minimac2_can_rx(NetClientState *nc)
     return 0;
 }
 
-static void minimac2_cleanup(NetClientState *nc)
-{
-    MilkymistMinimac2State *s = qemu_get_nic_opaque(nc);
-
-    s->nic = NULL;
-}
-
 static void milkymist_minimac2_reset(DeviceState *d)
 {
     MilkymistMinimac2State *s = MILKYMIST_MINIMAC2(d);
@@ -454,7 +447,6 @@ static NetClientInfo net_milkymist_minimac2_info = {
     .size = sizeof(NICState),
     .can_receive = minimac2_can_rx,
     .receive = minimac2_rx,
-    .cleanup = minimac2_cleanup,
 };
 
 static int milkymist_minimac2_init(SysBusDevice *sbd)
@@ -472,7 +464,7 @@ static int milkymist_minimac2_init(SysBusDevice *sbd)
 
     /* register buffers memory */
     memory_region_init_ram(&s->buffers, OBJECT(dev), "milkymist-minimac2.buffers",
-                           buffers_size);
+                           buffers_size, &error_abort);
     vmstate_register_ram_global(&s->buffers);
     s->rx0_buf = memory_region_get_ram_ptr(&s->buffers);
     s->rx1_buf = s->rx0_buf + MINIMAC2_BUFFER_SIZE;
@@ -492,8 +484,7 @@ static const VMStateDescription vmstate_milkymist_minimac2_mdio = {
     .name = "milkymist-minimac2-mdio",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_INT32(last_clk, MilkymistMinimac2MdioState),
         VMSTATE_INT32(count, MilkymistMinimac2MdioState),
         VMSTATE_UINT32(data, MilkymistMinimac2MdioState),
@@ -509,8 +500,7 @@ static const VMStateDescription vmstate_milkymist_minimac2 = {
     .name = "milkymist-minimac2",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, MilkymistMinimac2State, R_MAX),
         VMSTATE_UINT16_ARRAY(phy_regs, MilkymistMinimac2State, R_PHY_MAX),
         VMSTATE_STRUCT(mdio, MilkymistMinimac2State, 0,

@@ -10,6 +10,7 @@ void cpu_stop_current(void);
 void cpu_synchronize_all_states(void);
 void cpu_synchronize_all_post_reset(void);
 void cpu_synchronize_all_post_init(void);
+void cpu_clean_all_dirty(void);
 
 void qtest_clock_warp(int64_t dest);
 
@@ -23,7 +24,6 @@ extern int smp_threads;
 #define smp_threads 1
 #endif
 
-void set_numa_modes(void);
 void list_cpus(FILE *f, fprintf_function cpu_fprintf, const char *optarg);
 
 #endif

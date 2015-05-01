@@ -45,6 +45,8 @@
 #include <xen/io/kbdif.h>
 #include <xen/io/protocols.h>
 
+#include "trace.h"
+
 #ifndef BTN_LEFT
 #define BTN_LEFT 0x110 /* from <linux/input.h> */
 #endif
@@ -93,10 +95,12 @@ struct XenFB {
 
 static int common_bind(struct common *c)
 {
-    int mfn;
+    uint64_t mfn;
 
-    if (xenstore_read_fe_int(&c->xendev, "page-ref", &mfn) == -1)
+    if (xenstore_read_fe_uint64(&c->xendev, "page-ref", &mfn) == -1)
 	return -1;
+    assert(mfn == (xen_pfn_t)mfn);
+
     if (xenstore_read_fe_int(&c->xendev, "event-channel", &c->xendev.remote_port) == -1)
 	return -1;
 
@@ -107,7 +111,7 @@ static int common_bind(struct common *c)
 	return -1;
 
     xen_be_bind_evtchn(&c->xendev);
-    xen_be_printf(&c->xendev, 1, "ring mfn %d, remote-port %d, local-port %d\n",
+    xen_be_printf(&c->xendev, 1, "ring mfn %"PRIx64", remote-port %d, local-port %d\n",
 		  mfn, c->xendev.remote_port, c->xendev.local_port);
 
     return 0;
@@ -322,6 +326,8 @@ static void xenfb_mouse_event(void *opaque,
     int dh = surface_height(surface);
     int i;
 
+    trace_xenfb_mouse_event(opaque, dx, dy, dz, button_state,
+                            xenfb->abs_pointer_wanted);
     if (xenfb->abs_pointer_wanted)
 	xenfb_send_position(xenfb,
 			    dx * (dw - 1) / 0x7fff,
@@ -378,6 +384,7 @@ static void input_connected(struct XenDevice *xendev)
     if (in->qmouse) {
         qemu_remove_mouse_event_handler(in->qmouse);
     }
+    trace_xenfb_input_connected(xendev, in->abs_pointer_wanted);
     in->qmouse = qemu_add_mouse_event_handler(xenfb_mouse_event, in,
 					      in->abs_pointer_wanted,
 					      "Xen PVFB Mouse");
@@ -409,7 +416,7 @@ static void input_event(struct XenDevice *xendev)
 
 /* -------------------------------------------------------------------- */
 
-static void xenfb_copy_mfns(int mode, int count, unsigned long *dst, void *src)
+static void xenfb_copy_mfns(int mode, int count, xen_pfn_t *dst, void *src)
 {
     uint32_t *src32 = src;
     uint64_t *src64 = src;
@@ -424,8 +431,8 @@ static int xenfb_map_fb(struct XenFB *xenfb)
     struct xenfb_page *page = xenfb->c.page;
     char *protocol = xenfb->c.xendev.protocol;
     int n_fbdirs;
-    unsigned long *pgmfns = NULL;
-    unsigned long *fbmfns = NULL;
+    xen_pfn_t *pgmfns = NULL;
+    xen_pfn_t *fbmfns = NULL;
     void *map, *pd;
     int mode, ret = -1;
 
@@ -483,8 +490,8 @@ static int xenfb_map_fb(struct XenFB *xenfb)
     n_fbdirs = xenfb->fbpages * mode / 8;
     n_fbdirs = (n_fbdirs + (XC_PAGE_SIZE - 1)) / XC_PAGE_SIZE;
 
-    pgmfns = g_malloc0(sizeof(unsigned long) * n_fbdirs);
-    fbmfns = g_malloc0(sizeof(unsigned long) * xenfb->fbpages);
+    pgmfns = g_malloc0(sizeof(xen_pfn_t) * n_fbdirs);
+    fbmfns = g_malloc0(sizeof(xen_pfn_t) * xenfb->fbpages);
 
     xenfb_copy_mfns(mode, n_fbdirs, pgmfns, pd);
     map = xc_map_foreign_pages(xen_xc, xenfb->c.xendev.dom,
@@ -495,7 +502,7 @@ static int xenfb_map_fb(struct XenFB *xenfb)
     munmap(map, n_fbdirs * XC_PAGE_SIZE);
 
     xenfb->pixels = xc_map_foreign_pages(xen_xc, xenfb->c.xendev.dom,
-					 PROT_READ | PROT_WRITE, fbmfns, xenfb->fbpages);
+            PROT_READ, fbmfns, xenfb->fbpages);
     if (xenfb->pixels == NULL)
 	goto out;
 
@@ -711,15 +718,17 @@ static void xenfb_update(void *opaque)
 
     /* resize if needed */
     if (xenfb->do_resize) {
+        pixman_format_code_t format;
+
         xenfb->do_resize = 0;
         switch (xenfb->depth) {
         case 16:
         case 32:
             /* console.c supported depth -> buffer can be used directly */
+            format = qemu_default_pixman_format(xenfb->depth, true);
             surface = qemu_create_displaysurface_from
-                (xenfb->width, xenfb->height, xenfb->depth,
-                 xenfb->row_stride, xenfb->pixels + xenfb->offset,
-                 false);
+                (xenfb->width, xenfb->height, format,
+                 xenfb->row_stride, xenfb->pixels + xenfb->offset);
             break;
         default:
             /* we must convert stuff */
@@ -903,6 +912,11 @@ static void fb_disconnect(struct XenDevice *xendev)
     fb->pixels = mmap(fb->pixels, fb->fbpages * XC_PAGE_SIZE,
                       PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON,
                       -1, 0);
+    if (fb->pixels == MAP_FAILED) {
+        xen_be_printf(xendev, 0,
+                "Couldn't replace the framebuffer with anonymous memory errno=%d\n",
+                errno);
+    }
     common_unbind(&fb->c);
     fb->feature_update = 0;
     fb->bug_trigger    = 0;
@@ -987,7 +1001,7 @@ wait_more:
 
     /* vfb */
     fb = container_of(xfb, struct XenFB, c.xendev);
-    fb->c.con = graphic_console_init(NULL, &xenfb_ops, fb);
+    fb->c.con = graphic_console_init(NULL, 0, &xenfb_ops, fb);
     fb->have_console = 1;
 
     /* vkbd */

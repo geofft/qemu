@@ -181,8 +181,13 @@ static int coroutine_fn backup_before_write_notify(
         void *opaque)
 {
     BdrvTrackedRequest *req = opaque;
+    int64_t sector_num = req->offset >> BDRV_SECTOR_BITS;
+    int nb_sectors = req->bytes >> BDRV_SECTOR_BITS;
 
-    return backup_do_cow(req->bs, req->sector_num, req->nb_sectors, NULL);
+    assert((req->offset & (BDRV_SECTOR_SIZE - 1)) == 0);
+    assert((req->bytes & (BDRV_SECTOR_SIZE - 1)) == 0);
+
+    return backup_do_cow(req->bs, sector_num, nb_sectors, NULL);
 }
 
 static void backup_set_speed(BlockJob *job, int64_t speed, Error **errp)
@@ -222,9 +227,25 @@ static BlockErrorAction backup_error_action(BackupBlockJob *job,
     }
 }
 
+typedef struct {
+    int ret;
+} BackupCompleteData;
+
+static void backup_complete(BlockJob *job, void *opaque)
+{
+    BackupBlockJob *s = container_of(job, BackupBlockJob, common);
+    BackupCompleteData *data = opaque;
+
+    bdrv_unref(s->target);
+
+    block_job_completed(job, data->ret);
+    g_free(data);
+}
+
 static void coroutine_fn backup_run(void *opaque)
 {
     BackupBlockJob *job = opaque;
+    BackupCompleteData *data;
     BlockDriverState *bs = job->common.bs;
     BlockDriverState *target = job->target;
     BlockdevOnError on_target_error = job->on_target_error;
@@ -302,7 +323,7 @@ static void coroutine_fn backup_run(void *opaque)
                                 BACKUP_SECTORS_PER_CLUSTER - i, &n);
                     i += n;
 
-                    if (alloced == 1) {
+                    if (alloced == 1 || n == 0) {
                         break;
                     }
                 }
@@ -320,7 +341,7 @@ static void coroutine_fn backup_run(void *opaque)
                 /* Depending on error action, fail now or retry cluster */
                 BlockErrorAction action =
                     backup_error_action(job, error_is_read, -ret);
-                if (action == BDRV_ACTION_REPORT) {
+                if (action == BLOCK_ERROR_ACTION_REPORT) {
                     break;
                 } else {
                     start--;
@@ -339,16 +360,18 @@ static void coroutine_fn backup_run(void *opaque)
     hbitmap_free(job->bitmap);
 
     bdrv_iostatus_disable(target);
-    bdrv_unref(target);
+    bdrv_op_unblock_all(target, job->common.blocker);
 
-    block_job_completed(&job->common, ret);
+    data = g_malloc(sizeof(*data));
+    data->ret = ret;
+    block_job_defer_to_main_loop(&job->common, backup_complete, data);
 }
 
 void backup_start(BlockDriverState *bs, BlockDriverState *target,
                   int64_t speed, MirrorSyncMode sync_mode,
                   BlockdevOnError on_source_error,
                   BlockdevOnError on_target_error,
-                  BlockDriverCompletionFunc *cb, void *opaque,
+                  BlockCompletionFunc *cb, void *opaque,
                   Error **errp)
 {
     int64_t len;
@@ -357,10 +380,35 @@ void backup_start(BlockDriverState *bs, BlockDriverState *target,
     assert(target);
     assert(cb);
 
+    if (bs == target) {
+        error_setg(errp, "Source and target cannot be the same");
+        return;
+    }
+
     if ((on_source_error == BLOCKDEV_ON_ERROR_STOP ||
          on_source_error == BLOCKDEV_ON_ERROR_ENOSPC) &&
         !bdrv_iostatus_is_enabled(bs)) {
         error_set(errp, QERR_INVALID_PARAMETER, "on-source-error");
+        return;
+    }
+
+    if (!bdrv_is_inserted(bs)) {
+        error_setg(errp, "Device is not inserted: %s",
+                   bdrv_get_device_name(bs));
+        return;
+    }
+
+    if (!bdrv_is_inserted(target)) {
+        error_setg(errp, "Device is not inserted: %s",
+                   bdrv_get_device_name(target));
+        return;
+    }
+
+    if (bdrv_op_is_blocked(bs, BLOCK_OP_TYPE_BACKUP_SOURCE, errp)) {
+        return;
+    }
+
+    if (bdrv_op_is_blocked(target, BLOCK_OP_TYPE_BACKUP_TARGET, errp)) {
         return;
     }
 
@@ -376,6 +424,8 @@ void backup_start(BlockDriverState *bs, BlockDriverState *target,
     if (!job) {
         return;
     }
+
+    bdrv_op_block_all(target, job->common.blocker);
 
     job->on_source_error = on_source_error;
     job->on_target_error = on_target_error;

@@ -581,24 +581,11 @@ static const MemoryRegionOps eth_ops = {
     }
 };
 
-static void eth_cleanup(NetClientState *nc)
-{
-    ETRAXFSEthState *eth = qemu_get_nic_opaque(nc);
-
-    /* Disconnect the client.  */
-    eth->dma_out->client.push = NULL;
-    eth->dma_out->client.opaque = NULL;
-    eth->dma_in->client.opaque = NULL;
-    eth->dma_in->client.pull = NULL;
-        g_free(eth);
-}
-
 static NetClientInfo net_etraxfs_info = {
     .type = NET_CLIENT_OPTIONS_KIND_NIC,
     .size = sizeof(NICState),
     .can_receive = eth_can_receive,
     .receive = eth_receive,
-    .cleanup = eth_cleanup,
     .link_status_changed = eth_set_link,
 };
 
@@ -646,6 +633,8 @@ static void etraxfs_eth_class_init(ObjectClass *klass, void *data)
 
     k->init = fs_eth_init;
     dc->props = etraxfs_eth_properties;
+    /* Reason: pointer properties "dma_out", "dma_in" */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo etraxfs_eth_info = {

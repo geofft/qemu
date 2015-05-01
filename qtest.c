@@ -17,8 +17,12 @@
 #include "exec/ioport.h"
 #include "exec/memory.h"
 #include "hw/irq.h"
+#include "sysemu/accel.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/cpus.h"
+#include "qemu/config-file.h"
+#include "qemu/option.h"
+#include "qemu/error-report.h"
 
 #define MAX_IRQ 256
 
@@ -148,7 +152,7 @@ static int hex2nib(char ch)
     } else if (ch >= 'a' && ch <= 'f') {
         return 10 + (ch - 'a');
     } else if (ch >= 'A' && ch <= 'F') {
-        return 10 + (ch - 'a');
+        return 10 + (ch - 'A');
     } else {
         return -1;
     }
@@ -197,8 +201,8 @@ static void GCC_FMT_ATTR(2, 3) qtest_send(CharDriverState *chr,
 
 static void qtest_irq_handler(void *opaque, int n, int level)
 {
-    qemu_irq *old_irqs = opaque;
-    qemu_set_irq(old_irqs[n], level);
+    qemu_irq old_irq = *(qemu_irq *)opaque;
+    qemu_set_irq(old_irq, level);
 
     if (irq_levels[n] != level) {
         CharDriverState *chr = qtest_chr;
@@ -233,7 +237,8 @@ static void qtest_process_command(CharDriverState *chr, gchar **words)
     g_assert(command);
     if (strcmp(words[0], "irq_intercept_out") == 0
         || strcmp(words[0], "irq_intercept_in") == 0) {
-	DeviceState *dev;
+        DeviceState *dev;
+        NamedGPIOList *ngl;
 
         g_assert(words[1]);
         dev = DEVICE(object_resolve_path(words[1], NULL));
@@ -253,10 +258,25 @@ static void qtest_process_command(CharDriverState *chr, gchar **words)
 	    return;
         }
 
-        if (words[0][14] == 'o') {
-            qemu_irq_intercept_out(&dev->gpio_out, qtest_irq_handler, dev->num_gpio_out);
-        } else {
-            qemu_irq_intercept_in(dev->gpio_in, qtest_irq_handler, dev->num_gpio_in);
+        QLIST_FOREACH(ngl, &dev->gpios, node) {
+            /* We don't support intercept of named GPIOs yet */
+            if (ngl->name) {
+                continue;
+            }
+            if (words[0][14] == 'o') {
+                int i;
+                for (i = 0; i < ngl->num_out; ++i) {
+                    qemu_irq *disconnected = g_new0(qemu_irq, 1);
+                    qemu_irq icpt = qemu_allocate_irq(qtest_irq_handler,
+                                                      disconnected, i);
+
+                    *disconnected = qdev_intercept_gpio_out(dev, icpt,
+                                                            ngl->name, i);
+                }
+            } else {
+                qemu_irq_intercept_in(ngl->in, qtest_irq_handler,
+                                      ngl->num_in);
+            }
         }
         irq_intercept_dev = dev;
         qtest_send_prefix(chr);
@@ -500,23 +520,27 @@ static void qtest_event(void *opaque, int event)
     }
 }
 
-int qtest_init_accel(void)
+static int qtest_init_accel(MachineState *ms)
 {
-    configure_icount("0");
-
+    QemuOpts *opts = qemu_opts_create(qemu_find_opts("icount"), NULL, 0,
+                                      &error_abort);
+    qemu_opt_set(opts, "shift", "0", &error_abort);
+    configure_icount(opts, &error_abort);
+    qemu_opts_del(opts);
     return 0;
 }
 
-void qtest_init(const char *qtest_chrdev, const char *qtest_log)
+void qtest_init(const char *qtest_chrdev, const char *qtest_log, Error **errp)
 {
     CharDriverState *chr;
 
     chr = qemu_chr_new("qtest", qtest_chrdev, NULL);
 
-    qemu_chr_add_handlers(chr, qtest_can_read, qtest_read, qtest_event, chr);
-    qemu_chr_fe_set_echo(chr, true);
-
-    inbuf = g_string_new("");
+    if (chr == NULL) {
+        error_setg(errp, "Failed to initialize device for qtest: \"%s\"",
+                   qtest_chrdev);
+        return;
+    }
 
     if (qtest_log) {
         if (strcmp(qtest_log, "none") != 0) {
@@ -526,5 +550,38 @@ void qtest_init(const char *qtest_chrdev, const char *qtest_log)
         qtest_log_fp = stderr;
     }
 
+    qemu_chr_add_handlers(chr, qtest_can_read, qtest_read, qtest_event, chr);
+    qemu_chr_fe_set_echo(chr, true);
+
+    inbuf = g_string_new("");
     qtest_chr = chr;
 }
+
+bool qtest_driver(void)
+{
+    return qtest_chr;
+}
+
+static void qtest_accel_class_init(ObjectClass *oc, void *data)
+{
+    AccelClass *ac = ACCEL_CLASS(oc);
+    ac->name = "QTest";
+    ac->available = qtest_available;
+    ac->init_machine = qtest_init_accel;
+    ac->allowed = &qtest_allowed;
+}
+
+#define TYPE_QTEST_ACCEL ACCEL_CLASS_NAME("qtest")
+
+static const TypeInfo qtest_accel_type = {
+    .name = TYPE_QTEST_ACCEL,
+    .parent = TYPE_ACCEL,
+    .class_init = qtest_accel_class_init,
+};
+
+static void qtest_type_init(void)
+{
+    type_register_static(&qtest_accel_type);
+}
+
+type_init(qtest_type_init);

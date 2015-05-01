@@ -41,6 +41,7 @@
 #include <assert.h>
 #include <signal.h>
 #include "glib-compat.h"
+#include "qemu/option.h"
 
 #ifdef _WIN32
 #include "sysemu/os-win32.h"
@@ -104,9 +105,16 @@ static inline char *realpath(const char *path, char *resolved_path)
 }
 #endif
 
+void cpu_ticks_init(void);
+
 /* icount */
-void configure_icount(const char *option);
+void configure_icount(QemuOpts *opts, Error **errp);
 extern int use_icount;
+extern int icount_align_option;
+/* drift information for info jit command */
+extern int64_t max_delay;
+extern int64_t max_advance;
+void dump_drift_info(FILE *f, fprintf_function cpu_fprintf);
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -123,18 +131,6 @@ int qemu_main(int argc, char **argv, char **envp);
 
 void qemu_get_timedate(struct tm *tm, int offset);
 int qemu_timedate_diff(struct tm *tm);
-
-#if !GLIB_CHECK_VERSION(2, 20, 0)
-/*
- * Glib before 2.20.0 doesn't implement g_poll, so wrap it to compile properly
- * on older systems.
- */
-static inline gint g_poll(GPollFD *fds, guint nfds, gint timeout)
-{
-    GMainContext *ctx = g_main_context_default();
-    return g_main_context_get_poll_func(ctx)(fds, nfds, timeout);
-}
-#endif
 
 /**
  * is_help_option:
@@ -193,6 +189,9 @@ int64_t strtosz_suffix_unit(const char *nptr, char **end,
 
 /* used to print char* safely */
 #define STR_OR_NULL(str) ((str) ? (str) : "null")
+
+/* id.c */
+bool id_wellformed(const char *id);
 
 /* path.c */
 void init_paths(const char *prefix);
@@ -261,14 +260,6 @@ typedef int (*DMA_transfer_handler) (void *opaque, int nchan, int pos, int size)
 
 typedef uint64_t pcibus_t;
 
-typedef enum LostTickPolicy {
-    LOST_TICK_DISCARD,
-    LOST_TICK_DELAY,
-    LOST_TICK_MERGE,
-    LOST_TICK_SLEW,
-    LOST_TICK_MAX
-} LostTickPolicy;
-
 typedef struct PCIHostDeviceAddress {
     unsigned int domain;
     unsigned int bus;
@@ -335,9 +326,10 @@ void qemu_iovec_init_external(QEMUIOVector *qiov, struct iovec *iov, int niov);
 void qemu_iovec_add(QEMUIOVector *qiov, void *base, size_t len);
 void qemu_iovec_concat(QEMUIOVector *dst,
                        QEMUIOVector *src, size_t soffset, size_t sbytes);
-void qemu_iovec_concat_iov(QEMUIOVector *dst,
-                           struct iovec *src_iov, unsigned int src_cnt,
-                           size_t soffset, size_t sbytes);
+size_t qemu_iovec_concat_iov(QEMUIOVector *dst,
+                             struct iovec *src_iov, unsigned int src_cnt,
+                             size_t soffset, size_t sbytes);
+bool qemu_iovec_is_zero(QEMUIOVector *qiov);
 void qemu_iovec_destroy(QEMUIOVector *qiov);
 void qemu_iovec_reset(QEMUIOVector *qiov);
 size_t qemu_iovec_to_buf(QEMUIOVector *qiov, size_t offset,
@@ -346,6 +338,9 @@ size_t qemu_iovec_from_buf(QEMUIOVector *qiov, size_t offset,
                            const void *buf, size_t bytes);
 size_t qemu_iovec_memset(QEMUIOVector *qiov, size_t offset,
                          int fillc, size_t bytes);
+ssize_t qemu_iovec_compare(QEMUIOVector *a, QEMUIOVector *b);
+void qemu_iovec_clone(QEMUIOVector *dest, const QEMUIOVector *src, void *buf);
+void qemu_iovec_discard_back(QEMUIOVector *qiov, size_t bytes);
 
 bool buffer_is_zero(const void *buf, size_t len);
 
@@ -360,9 +355,8 @@ char *qemu_find_file(int type, const char *name);
 
 /* OS specific functions */
 void os_setup_early_signal_handling(void);
-char *os_find_datadir(const char *argv0);
+char *os_find_datadir(void);
 void os_parse_cmd_args(int index, const char *optarg);
-void os_pidfile_error(void);
 
 /* Convert a byte between binary and BCD.  */
 static inline uint8_t to_bcd(uint8_t val)
@@ -376,6 +370,12 @@ static inline uint8_t from_bcd(uint8_t val)
 }
 
 /* compute with 96 bit intermediate result: (a*b)/c */
+#ifdef CONFIG_INT128
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c)
+{
+    return (__int128_t)a * b / c;
+}
+#else
 static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c)
 {
     union {
@@ -398,6 +398,7 @@ static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c)
     res.l.low = (((rh % c) << 32) + (rl & 0xffffffff)) / c;
     return res.ll;
 }
+#endif
 
 /* Round number down to multiple */
 #define QEMU_ALIGN_DOWN(n, m) ((n) / (m) * (m))
@@ -416,6 +417,9 @@ static inline bool is_power_of_2(uint64_t value)
 
 /* round down to the nearest power of 2*/
 int64_t pow2floor(int64_t value);
+
+/* round up to the nearest power of 2 (0 if overflow) */
+uint64_t pow2ceil(uint64_t value);
 
 #include "qemu/module.h"
 
@@ -477,5 +481,7 @@ size_t buffer_find_nonzero_offset(const void *buf, size_t len);
  * helper to parse debug environment variables
  */
 int parse_debug_env(const char *name, int max, int initial);
+
+const char *qemu_ether_ntoa(const MACAddr *mac);
 
 #endif

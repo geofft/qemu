@@ -21,10 +21,8 @@
 #include "hw/sysbus.h"
 #include "sysemu/sysemu.h"
 #include "hw/isa/isa.h"
-#include "exec/address-spaces.h"
 
 static ISABus *isabus;
-hwaddr isa_mem_base = 0;
 
 static void isabus_dev_print(Monitor *mon, DeviceState *dev, int indent);
 static char *isabus_get_fw_dev_path(DeviceState *dev);
@@ -44,18 +42,20 @@ static const TypeInfo isa_bus_info = {
     .class_init = isa_bus_class_init,
 };
 
-ISABus *isa_bus_new(DeviceState *dev, MemoryRegion *address_space_io)
+ISABus *isa_bus_new(DeviceState *dev, MemoryRegion* address_space,
+                    MemoryRegion *address_space_io)
 {
     if (isabus) {
         fprintf(stderr, "Can't create a second ISA bus\n");
         return NULL;
     }
-    if (NULL == dev) {
+    if (!dev) {
         dev = qdev_create(NULL, "isabus-bridge");
         qdev_init_nofail(dev);
     }
 
     isabus = ISA_BUS(qbus_create(TYPE_ISA_BUS, dev, NULL));
+    isabus->address_space = address_space;
     isabus->address_space_io = address_space_io;
     return isabus;
 }
@@ -108,15 +108,20 @@ void isa_register_portio_list(ISADevice *dev, uint16_t start,
                               const MemoryRegionPortio *pio_start,
                               void *opaque, const char *name)
 {
-    PortioList *piolist = g_new(PortioList, 1);
+    PortioList piolist;
 
     /* START is how we should treat DEV, regardless of the actual
        contents of the portio array.  This is how the old code
        actually handled e.g. the FDC device.  */
     isa_init_ioport(dev, start);
 
-    portio_list_init(piolist, OBJECT(dev), pio_start, opaque, name);
-    portio_list_add(piolist, isabus->address_space_io, start);
+    /* FIXME: the device should store created PortioList in its state.  Note
+       that DEV can be NULL here and that single device can register several
+       portio lists.  Current implementation is leaking memory allocated
+       in portio_list_init.  The leak is not critical because it happens only
+       at initialization time.  */
+    portio_list_init(&piolist, OBJECT(dev), pio_start, opaque, name);
+    portio_list_add(&piolist, isabus->address_space_io, start);
 }
 
 static void isa_device_init(Object *obj)
@@ -197,7 +202,6 @@ static void isabus_bridge_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->fw_name = "isa";
-    dc->no_user = 1;
 }
 
 static const TypeInfo isabus_bridge_info = {
@@ -246,7 +250,11 @@ static char *isabus_get_fw_dev_path(DeviceState *dev)
 
 MemoryRegion *isa_address_space(ISADevice *dev)
 {
-    return get_system_memory();
+    if (dev) {
+        return isa_bus_from_device(dev)->address_space;
+    }
+
+    return isabus->address_space;
 }
 
 MemoryRegion *isa_address_space_io(ISADevice *dev)

@@ -131,11 +131,13 @@ static void nmi_handler(void *opaque, int irq, int level)
 }
 
 static void irq_handler(void *opaque, int irq, int level)
-{   
+{
     struct etrax_pic *fs = (void *)opaque;
 
-    if (irq >= 30)
-        return nmi_handler(opaque, irq, level);
+    if (irq >= 30) {
+        nmi_handler(opaque, irq, level);
+        return;
+    }
 
     irq -= 1;
     fs->regs[R_R_VECT] &= ~(1 << irq);
@@ -170,6 +172,10 @@ static void etraxfs_pic_class_init(ObjectClass *klass, void *data)
 
     k->init = etraxfs_pic_init;
     dc->props = etraxfs_pic_properties;
+    /*
+     * Note: pointer property "interrupt_vector" may remain null, thus
+     * no need for dc->cannot_instantiate_with_device_add_yet = true;
+     */
 }
 
 static const TypeInfo etraxfs_pic_info = {

@@ -30,6 +30,7 @@
 
 #include "qemu-common.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "sysemu/sysemu.h"
 #include "x_keymap.h"
 #include "sdl_zoom.h"
@@ -60,15 +61,23 @@ static SDL_PixelFormat host_format;
 static int scaling_active = 0;
 static Notifier mouse_mode_notifier;
 
+#if 0
+#define DEBUG_SDL
+#endif
+
 static void sdl_update(DisplayChangeListener *dcl,
                        int x, int y, int w, int h)
 {
-    //    printf("updating x=%d y=%d w=%d h=%d\n", x, y, w, h);
     SDL_Rect rec;
     rec.x = x;
     rec.y = y;
     rec.w = w;
     rec.h = h;
+
+#ifdef DEBUG_SDL
+    printf("SDL: Updating x=%d y=%d w=%d h=%d (scaling: %d)\n",
+           x, y, w, h, scaling_active);
+#endif
 
     if (guest_screen) {
         if (!scaling_active) {
@@ -88,7 +97,9 @@ static void do_sdl_resize(int width, int height, int bpp)
     int flags;
     SDL_Surface *tmp_screen;
 
-    //    printf("resizing to %d %d\n", w, h);
+#ifdef DEBUG_SDL
+    printf("SDL: Resizing to %dx%d bpp %d\n", width, height, bpp);
+#endif
 
     flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL;
     if (gui_fullscreen) {
@@ -124,11 +135,13 @@ static void do_sdl_resize(int width, int height, int bpp)
 static void sdl_switch(DisplayChangeListener *dcl,
                        DisplaySurface *new_surface)
 {
+    PixelFormat pf;
 
     /* temporary hack: allows to call sdl_switch to handle scaling changes */
     if (new_surface) {
         surface = new_surface;
     }
+    pf = qemu_pixelformat_from_pixman(surface->format);
 
     if (!scaling_active) {
         do_sdl_resize(surface_width(surface), surface_height(surface), 0);
@@ -141,12 +154,31 @@ static void sdl_switch(DisplayChangeListener *dcl,
     if (guest_screen != NULL) {
         SDL_FreeSurface(guest_screen);
     }
+
+#ifdef DEBUG_SDL
+    printf("SDL: Creating surface with masks: %08x %08x %08x %08x\n",
+           pf.rmask, pf.gmask, pf.bmask, pf.amask);
+#endif
+
     guest_screen = SDL_CreateRGBSurfaceFrom
         (surface_data(surface),
          surface_width(surface), surface_height(surface),
          surface_bits_per_pixel(surface), surface_stride(surface),
-         surface->pf.rmask, surface->pf.gmask,
-         surface->pf.bmask, surface->pf.amask);
+         pf.rmask, pf.gmask,
+         pf.bmask, pf.amask);
+}
+
+static bool sdl_check_format(DisplayChangeListener *dcl,
+                             pixman_format_code_t format)
+{
+    /*
+     * We let SDL convert for us a few more formats than,
+     * the native ones. Thes are the ones I have tested.
+     */
+    return (format == PIXMAN_x8r8g8b8 ||
+            format == PIXMAN_b8g8r8x8 ||
+            format == PIXMAN_x1r5g5b5 ||
+            format == PIXMAN_r5g6b5);
 }
 
 /* generic keyboard conversion */
@@ -261,9 +293,7 @@ static void reset_keys(void)
     int i;
     for(i = 0; i < 256; i++) {
         if (modifiers_state[i]) {
-            if (i & SCANCODE_GREY)
-                kbd_put_keycode(SCANCODE_EMUL0);
-            kbd_put_keycode(i | SCANCODE_UP);
+            qemu_input_event_send_key_number(dcl->con, i, false);
             modifiers_state[i] = 0;
         }
     }
@@ -271,16 +301,12 @@ static void reset_keys(void)
 
 static void sdl_process_key(SDL_KeyboardEvent *ev)
 {
-    int keycode, v;
+    int keycode;
 
     if (ev->keysym.sym == SDLK_PAUSE) {
         /* specific case */
-        v = 0;
-        if (ev->type == SDL_KEYUP)
-            v |= SCANCODE_UP;
-        kbd_put_keycode(0xe1);
-        kbd_put_keycode(0x1d | v);
-        kbd_put_keycode(0x45 | v);
+        qemu_input_event_send_key_qcode(dcl->con, Q_KEY_CODE_PAUSE,
+                                        ev->type == SDL_KEYDOWN);
         return;
     }
 
@@ -312,19 +338,15 @@ static void sdl_process_key(SDL_KeyboardEvent *ev)
     case 0x45: /* num lock */
     case 0x3a: /* caps lock */
         /* SDL does not send the key up event, so we generate it */
-        kbd_put_keycode(keycode);
-        kbd_put_keycode(keycode | SCANCODE_UP);
+        qemu_input_event_send_key_number(dcl->con, keycode, true);
+        qemu_input_event_send_key_number(dcl->con, keycode, false);
         return;
 #endif
     }
 
     /* now send the key code */
-    if (keycode & SCANCODE_GREY)
-        kbd_put_keycode(SCANCODE_EMUL0);
-    if (ev->type == SDL_KEYUP)
-        kbd_put_keycode(keycode | SCANCODE_UP);
-    else
-        kbd_put_keycode(keycode & SCANCODE_KEYCODEMASK);
+    qemu_input_event_send_key_number(dcl->con, keycode,
+                                     ev->type == SDL_KEYDOWN);
 }
 
 static void sdl_update_caption(void)
@@ -360,7 +382,7 @@ static void sdl_hide_cursor(void)
     if (!cursor_hide)
         return;
 
-    if (kbd_mouse_is_absolute()) {
+    if (qemu_input_is_absolute()) {
         SDL_ShowCursor(1);
         SDL_SetCursor(sdl_cursor_hidden);
     } else {
@@ -373,10 +395,10 @@ static void sdl_show_cursor(void)
     if (!cursor_hide)
         return;
 
-    if (!kbd_mouse_is_absolute() || !qemu_console_is_graphic(NULL)) {
+    if (!qemu_input_is_absolute() || !qemu_console_is_graphic(NULL)) {
         SDL_ShowCursor(1);
         if (guest_cursor &&
-                (gui_grab || kbd_mouse_is_absolute() || absolute_enabled))
+                (gui_grab || qemu_input_is_absolute() || absolute_enabled))
             SDL_SetCursor(guest_sprite);
         else
             SDL_SetCursor(sdl_cursor_normal);
@@ -395,8 +417,9 @@ static void sdl_grab_start(void)
     }
     if (guest_cursor) {
         SDL_SetCursor(guest_sprite);
-        if (!kbd_mouse_is_absolute() && !absolute_enabled)
+        if (!qemu_input_is_absolute() && !absolute_enabled) {
             SDL_WarpMouse(guest_x, guest_y);
+        }
     } else
         sdl_hide_cursor();
     SDL_WM_GrabInput(SDL_GRAB_ON);
@@ -425,7 +448,7 @@ static void absolute_mouse_grab(void)
 
 static void sdl_mouse_mode_change(Notifier *notify, void *data)
 {
-    if (kbd_mouse_is_absolute()) {
+    if (qemu_input_is_absolute()) {
         if (!absolute_enabled) {
             absolute_enabled = 1;
             if (qemu_console_is_graphic(NULL)) {
@@ -440,38 +463,49 @@ static void sdl_mouse_mode_change(Notifier *notify, void *data)
     }
 }
 
-static void sdl_send_mouse_event(int dx, int dy, int dz, int x, int y, int state)
+static void sdl_send_mouse_event(int dx, int dy, int x, int y, int state)
 {
-    int buttons = 0;
+    static uint32_t bmap[INPUT_BUTTON_MAX] = {
+        [INPUT_BUTTON_LEFT]       = SDL_BUTTON(SDL_BUTTON_LEFT),
+        [INPUT_BUTTON_MIDDLE]     = SDL_BUTTON(SDL_BUTTON_MIDDLE),
+        [INPUT_BUTTON_RIGHT]      = SDL_BUTTON(SDL_BUTTON_RIGHT),
+        [INPUT_BUTTON_WHEEL_UP]   = SDL_BUTTON(SDL_BUTTON_WHEELUP),
+        [INPUT_BUTTON_WHEEL_DOWN] = SDL_BUTTON(SDL_BUTTON_WHEELDOWN),
+    };
+    static uint32_t prev_state;
 
-    if (state & SDL_BUTTON(SDL_BUTTON_LEFT)) {
-        buttons |= MOUSE_EVENT_LBUTTON;
-    }
-    if (state & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
-        buttons |= MOUSE_EVENT_RBUTTON;
-    }
-    if (state & SDL_BUTTON(SDL_BUTTON_MIDDLE)) {
-        buttons |= MOUSE_EVENT_MBUTTON;
-    }
-
-    if (kbd_mouse_is_absolute()) {
-        dx = x * 0x7FFF / (real_screen->w - 1);
-        dy = y * 0x7FFF / (real_screen->h - 1);
-    } else if (guest_cursor) {
-        x -= guest_x;
-        y -= guest_y;
-        guest_x += x;
-        guest_y += y;
-        dx = x;
-        dy = y;
+    if (prev_state != state) {
+        qemu_input_update_buttons(dcl->con, bmap, prev_state, state);
+        prev_state = state;
     }
 
-    kbd_mouse_event(dx, dy, dz, buttons);
+    if (qemu_input_is_absolute()) {
+        qemu_input_queue_abs(dcl->con, INPUT_AXIS_X, x,
+                             real_screen->w);
+        qemu_input_queue_abs(dcl->con, INPUT_AXIS_Y, y,
+                             real_screen->h);
+    } else {
+        if (guest_cursor) {
+            x -= guest_x;
+            y -= guest_y;
+            guest_x += x;
+            guest_y += y;
+            dx = x;
+            dy = y;
+        }
+        qemu_input_queue_rel(dcl->con, INPUT_AXIS_X, dx);
+        qemu_input_queue_rel(dcl->con, INPUT_AXIS_Y, dy);
+    }
+    qemu_input_event_sync();
 }
 
 static void sdl_scale(int width, int height)
 {
     int bpp = real_screen->format->BitsPerPixel;
+
+#ifdef DEBUG_SDL
+    printf("SDL: Scaling to %dx%d bpp %d\n", width, height, bpp);
+#endif
 
     if (bpp != 16 && bpp != 32) {
         bpp = 32;
@@ -694,7 +728,7 @@ static void handle_mousemotion(SDL_Event *ev)
     int max_x, max_y;
 
     if (qemu_console_is_graphic(NULL) &&
-        (kbd_mouse_is_absolute() || absolute_enabled)) {
+        (qemu_input_is_absolute() || absolute_enabled)) {
         max_x = real_screen->w - 1;
         max_y = real_screen->h - 1;
         if (gui_grab && (ev->motion.x == 0 || ev->motion.y == 0 ||
@@ -707,8 +741,8 @@ static void handle_mousemotion(SDL_Event *ev)
             sdl_grab_start();
         }
     }
-    if (gui_grab || kbd_mouse_is_absolute() || absolute_enabled) {
-        sdl_send_mouse_event(ev->motion.xrel, ev->motion.yrel, 0,
+    if (gui_grab || qemu_input_is_absolute() || absolute_enabled) {
+        sdl_send_mouse_event(ev->motion.xrel, ev->motion.yrel,
                              ev->motion.x, ev->motion.y, ev->motion.state);
     }
 }
@@ -717,35 +751,24 @@ static void handle_mousebutton(SDL_Event *ev)
 {
     int buttonstate = SDL_GetMouseState(NULL, NULL);
     SDL_MouseButtonEvent *bev;
-    int dz;
 
     if (!qemu_console_is_graphic(NULL)) {
         return;
     }
 
     bev = &ev->button;
-    if (!gui_grab && !kbd_mouse_is_absolute()) {
+    if (!gui_grab && !qemu_input_is_absolute()) {
         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
             /* start grabbing all events */
             sdl_grab_start();
         }
     } else {
-        dz = 0;
         if (ev->type == SDL_MOUSEBUTTONDOWN) {
             buttonstate |= SDL_BUTTON(bev->button);
         } else {
             buttonstate &= ~SDL_BUTTON(bev->button);
         }
-#ifdef SDL_BUTTON_WHEELUP
-        if (bev->button == SDL_BUTTON_WHEELUP &&
-            ev->type == SDL_MOUSEBUTTONDOWN) {
-            dz = -1;
-        } else if (bev->button == SDL_BUTTON_WHEELDOWN &&
-                   ev->type == SDL_MOUSEBUTTONDOWN) {
-            dz = 1;
-        }
-#endif
-        sdl_send_mouse_event(0, 0, dz, bev->x, bev->y, buttonstate);
+        sdl_send_mouse_event(0, 0, bev->x, bev->y, buttonstate);
     }
 }
 
@@ -760,7 +783,7 @@ static void handle_activation(SDL_Event *ev)
     }
 #endif
     if (!gui_grab && ev->active.gain && qemu_console_is_graphic(NULL) &&
-        (kbd_mouse_is_absolute() || absolute_enabled)) {
+        (qemu_input_is_absolute() || absolute_enabled)) {
         absolute_mouse_grab();
     }
     if (ev->active.state & SDL_APPACTIVE) {
@@ -832,10 +855,11 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
     if (on) {
         if (!guest_cursor)
             sdl_show_cursor();
-        if (gui_grab || kbd_mouse_is_absolute() || absolute_enabled) {
+        if (gui_grab || qemu_input_is_absolute() || absolute_enabled) {
             SDL_SetCursor(guest_sprite);
-            if (!kbd_mouse_is_absolute() && !absolute_enabled)
+            if (!qemu_input_is_absolute() && !absolute_enabled) {
                 SDL_WarpMouse(x, y);
+            }
         }
     } else if (gui_grab)
         sdl_hide_cursor();
@@ -863,7 +887,7 @@ static void sdl_mouse_define(DisplayChangeListener *dcl,
     g_free(mask);
 
     if (guest_cursor &&
-            (gui_grab || kbd_mouse_is_absolute() || absolute_enabled))
+            (gui_grab || qemu_input_is_absolute() || absolute_enabled))
         SDL_SetCursor(guest_sprite);
 }
 
@@ -875,12 +899,13 @@ static void sdl_cleanup(void)
 }
 
 static const DisplayChangeListenerOps dcl_ops = {
-    .dpy_name          = "sdl",
-    .dpy_gfx_update    = sdl_update,
-    .dpy_gfx_switch    = sdl_switch,
-    .dpy_refresh       = sdl_refresh,
-    .dpy_mouse_set     = sdl_mouse_warp,
-    .dpy_cursor_define = sdl_mouse_define,
+    .dpy_name             = "sdl",
+    .dpy_gfx_update       = sdl_update,
+    .dpy_gfx_switch       = sdl_switch,
+    .dpy_gfx_check_format = sdl_check_format,
+    .dpy_refresh          = sdl_refresh,
+    .dpy_mouse_set        = sdl_mouse_warp,
+    .dpy_cursor_define    = sdl_mouse_define,
 };
 
 void sdl_display_init(DisplayState *ds, int full_screen, int no_frame)

@@ -45,7 +45,6 @@
 
 /* public */
 XenXC xen_xc = XC_HANDLER_INITIAL_VALUE;
-XenGnttab xen_xcg = XC_HANDLER_INITIAL_VALUE;
 struct xs_handle *xenstore = NULL;
 const char *xen_protocol;
 
@@ -112,6 +111,19 @@ int xenstore_read_int(const char *base, const char *node, int *ival)
     return rc;
 }
 
+int xenstore_read_uint64(const char *base, const char *node, uint64_t *uval)
+{
+    char *val;
+    int rc = -1;
+
+    val = xenstore_read_str(base, node);
+    if (val && 1 == sscanf(val, "%"SCNu64, uval)) {
+        rc = 0;
+    }
+    g_free(val);
+    return rc;
+}
+
 int xenstore_write_be_str(struct XenDevice *xendev, const char *node, const char *val)
 {
     return xenstore_write_str(xendev->be, node, val);
@@ -145,6 +157,11 @@ char *xenstore_read_fe_str(struct XenDevice *xendev, const char *node)
 int xenstore_read_fe_int(struct XenDevice *xendev, const char *node, int *ival)
 {
     return xenstore_read_int(xendev->fe, node, ival);
+}
+
+int xenstore_read_fe_uint64(struct XenDevice *xendev, const char *node, uint64_t *uval)
+{
+    return xenstore_read_uint64(xendev->fe, node, uval);
 }
 
 /* ------------------------------------------------------------- */

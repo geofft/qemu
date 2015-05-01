@@ -252,6 +252,8 @@ static int vnc_worker_thread_loop(VncJobQueue *queue)
 
         if (job->vs->csock == -1) {
             vnc_unlock_display(job->vs->vd);
+            /* Copy persistent encoding data */
+            vnc_async_encoding_end(job->vs, &vs);
             goto disconnected;
         }
 
@@ -278,6 +280,9 @@ static int vnc_worker_thread_loop(VncJobQueue *queue)
         vnc_async_encoding_end(job->vs, &vs);
 
 	qemu_bh_schedule(job->vs->bh);
+    }  else {
+        /* Copy persistent encoding data */
+        vnc_async_encoding_end(job->vs, &vs);
     }
     vnc_unlock_output(job->vs);
 
@@ -333,19 +338,7 @@ void vnc_start_worker_thread(void)
         return ;
 
     q = vnc_queue_init();
-    qemu_thread_create(&q->thread, vnc_worker_thread, q, QEMU_THREAD_DETACHED);
+    qemu_thread_create(&q->thread, "vnc_worker", vnc_worker_thread, q,
+                       QEMU_THREAD_DETACHED);
     queue = q; /* Set global queue */
-}
-
-void vnc_stop_worker_thread(void)
-{
-    if (!vnc_worker_thread_running())
-        return ;
-
-    /* Remove all jobs and wake up the thread */
-    vnc_lock_queue(queue);
-    queue->exit = true;
-    vnc_unlock_queue(queue);
-    vnc_jobs_clear(NULL);
-    qemu_cond_broadcast(&queue->cond);
 }

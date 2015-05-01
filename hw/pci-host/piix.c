@@ -203,7 +203,7 @@ static const VMStateDescription vmstate_i440fx = {
     .minimum_version_id_old = 1,
     .load_state_old = i440fx_load_old,
     .post_load = i440fx_post_load,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, PCII440FXState),
         VMSTATE_UINT8(smm_enabled, PCII440FXState),
         VMSTATE_END_OF_LIST()
@@ -295,14 +295,13 @@ static void i440fx_pcihost_realize(DeviceState *dev, Error **errp)
     sysbus_init_ioports(sbd, 0xcfc, 4);
 }
 
-static int i440fx_initfn(PCIDevice *dev)
+static void i440fx_realize(PCIDevice *dev, Error **errp)
 {
     PCII440FXState *d = I440FX_PCI_DEVICE(dev);
 
     dev->config[I440FX_SMRAM] = 0x02;
 
     cpu_smm_register(&i440fx_set_smm, d);
-    return 0;
 }
 
 PCIBus *i440fx_init(PCII440FXState **pi440fx_state,
@@ -311,6 +310,7 @@ PCIBus *i440fx_init(PCII440FXState **pi440fx_state,
                     MemoryRegion *address_space_mem,
                     MemoryRegion *address_space_io,
                     ram_addr_t ram_size,
+                    ram_addr_t below_4g_mem_size,
                     ram_addr_t above_4g_mem_size,
                     MemoryRegion *pci_address_space,
                     MemoryRegion *ram_memory)
@@ -340,15 +340,7 @@ PCIBus *i440fx_init(PCII440FXState **pi440fx_state,
     f->ram_memory = ram_memory;
 
     i440fx = I440FX_PCI_HOST_BRIDGE(dev);
-    /* Set PCI window size the way seabios has always done it. */
-    /* Power of 2 so bios can cover it with a single MTRR */
-    if (ram_size <= 0x80000000) {
-        i440fx->pci_info.w32.begin = 0x80000000;
-    } else if (ram_size <= 0xc0000000) {
-        i440fx->pci_info.w32.begin = 0xc0000000;
-    } else {
-        i440fx->pci_info.w32.begin = 0xe0000000;
-    }
+    i440fx->pci_info.w32.begin = below_4g_mem_size;
 
     /* setup pci memory mapping */
     pc_pci_as_mapping_init(OBJECT(f), f->system_memory,
@@ -416,7 +408,7 @@ static void piix3_set_irq_pic(PIIX3State *piix3, int pic_irq)
                      (pic_irq * PIIX_NUM_PIRQS))));
 }
 
-static void piix3_set_irq_level(PIIX3State *piix3, int pirq, int level)
+static void piix3_set_irq_level_internal(PIIX3State *piix3, int pirq, int level)
 {
     int pic_irq;
     uint64_t mask;
@@ -429,6 +421,18 @@ static void piix3_set_irq_level(PIIX3State *piix3, int pirq, int level)
     mask = 1ULL << ((pic_irq * PIIX_NUM_PIRQS) + pirq);
     piix3->pic_levels &= ~mask;
     piix3->pic_levels |= mask * !!level;
+}
+
+static void piix3_set_irq_level(PIIX3State *piix3, int pirq, int level)
+{
+    int pic_irq;
+
+    pic_irq = piix3->dev.config[PIIX_PIRQC + pirq];
+    if (pic_irq >= PIIX_NUM_PIC_IRQS) {
+        return;
+    }
+
+    piix3_set_irq_level_internal(piix3, pirq, level);
 
     piix3_set_irq_pic(piix3, pic_irq);
 }
@@ -534,7 +538,21 @@ static void piix3_reset(void *opaque)
 static int piix3_post_load(void *opaque, int version_id)
 {
     PIIX3State *piix3 = opaque;
-    piix3_update_irq_levels(piix3);
+    int pirq;
+
+    /* Because the i8259 has not been deserialized yet, qemu_irq_raise
+     * might bring the system to a different state than the saved one;
+     * for example, the interrupt could be masked but the i8259 would
+     * not know that yet and would trigger an interrupt in the CPU.
+     *
+     * Here, we update irq levels without raising the interrupt.
+     * Interrupt state will be deserialized separately through the i8259.
+     */
+    piix3->pic_levels = 0;
+    for (pirq = 0; pirq < PIIX_NUM_PIRQS; pirq++) {
+        piix3_set_irq_level_internal(piix3, pirq,
+                            pci_bus_get_irq_level(piix3->dev.bus, pirq));
+    }
     return 0;
 }
 
@@ -560,7 +578,7 @@ static const VMStateDescription vmstate_piix3_rcr = {
     .name = "PIIX3/rcr",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8(rcr, PIIX3State),
         VMSTATE_END_OF_LIST()
     }
@@ -570,10 +588,9 @@ static const VMStateDescription vmstate_piix3 = {
     .name = "PIIX3",
     .version_id = 3,
     .minimum_version_id = 2,
-    .minimum_version_id_old = 2,
     .post_load = piix3_post_load,
     .pre_save = piix3_pre_save,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, PIIX3State),
         VMSTATE_INT32_ARRAY_V(pci_irq_levels_vmstate, PIIX3State,
                               PIIX_NUM_PIRQS, 3),
@@ -613,11 +630,12 @@ static const MemoryRegionOps rcr_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN
 };
 
-static int piix3_initfn(PCIDevice *dev)
+static void piix3_realize(PCIDevice *dev, Error **errp)
 {
     PIIX3State *d = DO_UPCAST(PIIX3State, dev, dev);
 
-    isa_bus_new(DEVICE(d), pci_address_space_io(dev));
+    isa_bus_new(DEVICE(d), get_system_memory(),
+                pci_address_space_io(dev));
 
     memory_region_init_io(&d->rcr_mem, OBJECT(dev), &rcr_ops, d,
                           "piix3-reset-control", 1);
@@ -625,7 +643,6 @@ static int piix3_initfn(PCIDevice *dev)
                                         &d->rcr_mem, 1);
 
     qemu_register_reset(piix3_reset, d);
-    return 0;
 }
 
 static void piix3_class_init(ObjectClass *klass, void *data)
@@ -635,14 +652,18 @@ static void piix3_class_init(ObjectClass *klass, void *data)
 
     dc->desc        = "ISA bridge";
     dc->vmsd        = &vmstate_piix3;
-    dc->no_user     = 1,
-    k->no_hotplug   = 1;
-    k->init         = piix3_initfn;
+    dc->hotpluggable   = false;
+    k->realize      = piix3_realize;
     k->config_write = piix3_write_config;
     k->vendor_id    = PCI_VENDOR_ID_INTEL;
     /* 82371SB PIIX3 PCI-to-ISA bridge (Step A1) */
     k->device_id    = PCI_DEVICE_ID_INTEL_82371SB_0;
     k->class_id     = PCI_CLASS_BRIDGE_ISA;
+    /*
+     * Reason: part of PIIX3 southbridge, needs to be wired up by
+     * pc_piix.c's pc_init1()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo piix3_info = {
@@ -659,14 +680,18 @@ static void piix3_xen_class_init(ObjectClass *klass, void *data)
 
     dc->desc        = "ISA bridge";
     dc->vmsd        = &vmstate_piix3;
-    dc->no_user     = 1;
-    k->no_hotplug   = 1;
-    k->init         = piix3_initfn;
+    dc->hotpluggable   = false;
+    k->realize      = piix3_realize;
     k->config_write = piix3_write_config_xen;
     k->vendor_id    = PCI_VENDOR_ID_INTEL;
     /* 82371SB PIIX3 PCI-to-ISA bridge (Step A1) */
     k->device_id    = PCI_DEVICE_ID_INTEL_82371SB_0;
     k->class_id     = PCI_CLASS_BRIDGE_ISA;
+    /*
+     * Reason: part of PIIX3 southbridge, needs to be wired up by
+     * pc_piix.c's pc_init1()
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 };
 
 static const TypeInfo piix3_xen_info = {
@@ -681,16 +706,20 @@ static void i440fx_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->no_hotplug = 1;
-    k->init = i440fx_initfn;
+    k->realize = i440fx_realize;
     k->config_write = i440fx_write_config;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_82441;
     k->revision = 0x02;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
     dc->desc = "Host bridge";
-    dc->no_user = 1;
     dc->vmsd = &vmstate_i440fx;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->hotpluggable   = false;
 }
 
 static const TypeInfo i440fx_info = {
@@ -727,7 +756,6 @@ static void i440fx_pcihost_class_init(ObjectClass *klass, void *data)
     hc->root_bus_path = i440fx_pcihost_root_bus_path;
     dc->realize = i440fx_pcihost_realize;
     dc->fw_name = "pci";
-    dc->no_user = 1;
     dc->props = i440fx_props;
 }
 

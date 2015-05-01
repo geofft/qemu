@@ -282,6 +282,7 @@ static SlirpState *slirp_lookup(Monitor *mon, const char *vlan,
         NetClientState *nc;
         nc = net_hub_find_client_by_name(strtol(vlan, NULL, 0), stack);
         if (!nc) {
+            monitor_printf(mon, "unrecognized (vlan-id, stackname) pair\n");
             return NULL;
         }
         if (strcmp(nc->model, "user")) {
@@ -298,7 +299,7 @@ static SlirpState *slirp_lookup(Monitor *mon, const char *vlan,
     }
 }
 
-void net_slirp_hostfwd_remove(Monitor *mon, const QDict *qdict)
+void hmp_hostfwd_remove(Monitor *mon, const QDict *qdict)
 {
     struct in_addr host_addr = { .s_addr = INADDR_ANY };
     int host_port;
@@ -344,8 +345,7 @@ void net_slirp_hostfwd_remove(Monitor *mon, const QDict *qdict)
 
     host_port = atoi(p);
 
-    err = slirp_remove_hostfwd(QTAILQ_FIRST(&slirp_stacks)->slirp, is_udp,
-                               host_addr, host_port);
+    err = slirp_remove_hostfwd(s->slirp, is_udp, host_addr, host_port);
 
     monitor_printf(mon, "host forwarding rule for %s %s\n", src_str,
                    err ? "not found" : "removed");
@@ -420,7 +420,7 @@ static int slirp_hostfwd(SlirpState *s, const char *redir_str,
     return -1;
 }
 
-void net_slirp_hostfwd_add(Monitor *mon, const QDict *qdict)
+void hmp_hostfwd_add(Monitor *mon, const QDict *qdict)
 {
     const char *redir_str;
     SlirpState *s;
@@ -523,13 +523,21 @@ static int slirp_smb(SlirpState* s, const char *exported_dir,
     fprintf(f,
             "[global]\n"
             "private dir=%s\n"
-            "socket address=127.0.0.1\n"
+            "interfaces=127.0.0.1\n"
+            "bind interfaces only=yes\n"
             "pid directory=%s\n"
             "lock directory=%s\n"
             "state directory=%s\n"
+            "cache directory=%s\n"
+            "ncalrpc dir=%s/ncalrpc\n"
             "log file=%s/log.smbd\n"
             "smb passwd file=%s/smbpasswd\n"
-            "security = share\n"
+            "security = user\n"
+            "map to guest = Bad User\n"
+            "load printers = no\n"
+            "printing = bsd\n"
+            "disable spoolss = yes\n"
+            "usershare max shares = 0\n"
             "[qemu]\n"
             "path=%s\n"
             "read only=no\n"
@@ -541,15 +549,18 @@ static int slirp_smb(SlirpState* s, const char *exported_dir,
             s->smb_dir,
             s->smb_dir,
             s->smb_dir,
+            s->smb_dir,
+            s->smb_dir,
             exported_dir,
             passwd->pw_name
             );
     fclose(f);
 
-    snprintf(smb_cmdline, sizeof(smb_cmdline), "%s -s %s",
-             CONFIG_SMBD_COMMAND, smb_conf);
+    snprintf(smb_cmdline, sizeof(smb_cmdline), "%s -l %s -s %s",
+             CONFIG_SMBD_COMMAND, s->smb_dir, smb_conf);
 
-    if (slirp_add_exec(s->slirp, 0, smb_cmdline, &vserver_addr, 139) < 0) {
+    if (slirp_add_exec(s->slirp, 0, smb_cmdline, &vserver_addr, 139) < 0 ||
+        slirp_add_exec(s->slirp, 0, smb_cmdline, &vserver_addr, 445) < 0) {
         slirp_smb_cleanup(s);
         error_report("conflicting/invalid smbserver address");
         return -1;
@@ -632,17 +643,16 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str,
         goto fail_syntax;
     }
 
-    fwd = g_malloc(sizeof(struct GuestFwd));
     snprintf(buf, sizeof(buf), "guestfwd.tcp.%d", port);
 
     if ((strlen(p) > 4) && !strncmp(p, "cmd:", 4)) {
         if (slirp_add_exec(s->slirp, 0, &p[4], &server, port) < 0) {
             error_report("conflicting/invalid host:port in guest forwarding "
                          "rule '%s'", config_str);
-            g_free(fwd);
             return -1;
         }
     } else {
+        fwd = g_new(struct GuestFwd, 1);
         fwd->hd = qemu_chr_new(buf, p, NULL);
         if (!fwd->hd) {
             error_report("could not open guest forwarding device '%s'", buf);
@@ -671,7 +681,7 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str,
     return -1;
 }
 
-void do_info_usernet(Monitor *mon, const QDict *qdict)
+void hmp_info_usernet(Monitor *mon, const QDict *qdict)
 {
     SlirpState *s;
 

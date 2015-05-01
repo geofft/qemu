@@ -233,7 +233,7 @@ static void bonito_writel(void *opaque, hwaddr addr,
     uint32_t saddr;
     int reset = 0;
 
-    saddr = (addr - BONITO_REGBASE) >> 2;
+    saddr = addr >> 2;
 
     DPRINTF("bonito_writel "TARGET_FMT_plx" val %x saddr %x\n", addr, val, saddr);
     switch (saddr) {
@@ -295,7 +295,7 @@ static uint64_t bonito_readl(void *opaque, hwaddr addr,
     PCIBonitoState *s = opaque;
     uint32_t saddr;
 
-    saddr = (addr - BONITO_REGBASE) >> 2;
+    saddr = addr >> 2;
 
     DPRINTF("bonito_readl "TARGET_FMT_plx"\n", addr);
     switch (saddr) {
@@ -687,8 +687,7 @@ static const VMStateDescription vmstate_bonito = {
     .name = "Bonito",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, PCIBonitoState),
         VMSTATE_END_OF_LIST()
     }
@@ -706,7 +705,7 @@ static int bonito_pcihost_initfn(SysBusDevice *dev)
     return 0;
 }
 
-static int bonito_initfn(PCIDevice *dev)
+static void bonito_realize(PCIDevice *dev, Error **errp)
 {
     PCIBonitoState *s = DO_UPCAST(PCIBonitoState, dev, dev);
     SysBusDevice *sysbus = SYS_BUS_DEVICE(s->pcihost);
@@ -767,8 +766,6 @@ static int bonito_initfn(PCIDevice *dev)
     pci_set_byte(dev->config + PCI_MAX_LAT, 0x00);
 
     qemu_register_reset(bonito_reset, s);
-
-    return 0;
 }
 
 PCIBus *bonito_init(qemu_irq *pic)
@@ -800,14 +797,18 @@ static void bonito_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->init = bonito_initfn;
+    k->realize = bonito_realize;
     k->vendor_id = 0xdf53;
     k->device_id = 0x00d5;
     k->revision = 0x01;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
     dc->desc = "Host bridge";
-    dc->no_user = 1;
     dc->vmsd = &vmstate_bonito;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo bonito_info = {
@@ -819,11 +820,9 @@ static const TypeInfo bonito_info = {
 
 static void bonito_pcihost_class_init(ObjectClass *klass, void *data)
 {
-    DeviceClass *dc = DEVICE_CLASS(klass);
     SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
 
     k->init = bonito_pcihost_initfn;
-    dc->no_user = 1;
 }
 
 static const TypeInfo bonito_pcihost_info = {

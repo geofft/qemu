@@ -198,8 +198,7 @@ static const VMStateDescription vmstate_mipsnet = {
     .name = "mipsnet",
     .version_id = 0,
     .minimum_version_id = 0,
-    .minimum_version_id_old = 0,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(busy, MIPSnetState),
         VMSTATE_UINT32(rx_count, MIPSnetState),
         VMSTATE_UINT32(rx_read, MIPSnetState),
@@ -212,19 +211,11 @@ static const VMStateDescription vmstate_mipsnet = {
     }
 };
 
-static void mipsnet_cleanup(NetClientState *nc)
-{
-    MIPSnetState *s = qemu_get_nic_opaque(nc);
-
-    s->nic = NULL;
-}
-
 static NetClientInfo net_mipsnet_info = {
     .type = NET_CLIENT_OPTIONS_KIND_NIC,
     .size = sizeof(NICState),
     .can_receive = mipsnet_can_receive,
     .receive = mipsnet_receive,
-    .cleanup = mipsnet_cleanup,
 };
 
 static const MemoryRegionOps mipsnet_ioport_ops = {

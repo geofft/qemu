@@ -25,8 +25,7 @@ _setenvironment()
     export MSGVERB
 }
 
-here=`pwd`
-rm -f $here/$iam.out
+rm -f "$OUTPUT_DIR/$iam.out"
 _setenvironment
 
 check=${check-true}
@@ -59,7 +58,7 @@ do
     if $group
     then
         # arg after -g
-        group_list=`sed -n <group -e 's/$/ /' -e "/^[0-9][0-9][0-9].* $r /"'{
+        group_list=`sed -n <"$source_iotests/group" -e 's/$/ /' -e "/^[0-9][0-9][0-9].* $r /"'{
 s/ .*//p
 }'`
         if [ -z "$group_list" ]
@@ -84,7 +83,7 @@ s/ .*//p
     then
         # arg after -x
         [ ! -s $tmp.list ] && ls [0-9][0-9][0-9] [0-9][0-9][0-9][0-9] >$tmp.list 2>/dev/null
-        group_list=`sed -n <group -e 's/$/ /' -e "/^[0-9][0-9][0-9].* $r /"'{
+        group_list=`sed -n <"$source_iotests/group" -e 's/$/ /' -e "/^[0-9][0-9][0-9].* $r /"'{
 s/ .*//p
 }'`
         if [ -z "$group_list" ]
@@ -136,7 +135,9 @@ common options
 
 check options
     -raw                test raw (default)
-    -cow                test cow
+    -bochs              test bochs
+    -cloop              test cloop
+    -parallels          test parallels
     -qcow               test qcow
     -qcow2              test qcow2
     -qed                test qed
@@ -144,10 +145,13 @@ check options
     -vpc                test vpc
     -vhdx               test vhdx
     -vmdk               test vmdk
+    -file               test file (default)
     -rbd                test rbd
     -sheepdog           test sheepdog
     -nbd                test nbd
     -ssh                test ssh
+    -nfs                test nfs
+    -archipelago        test archipelago
     -xdiff              graphical mode diff
     -nocache            use O_DIRECT on backing file
     -misalign           misalign memory allocations
@@ -171,8 +175,21 @@ testlist options
             xpand=false
             ;;
 
-        -cow)
-            IMGFMT=cow
+        -bochs)
+            IMGFMT=bochs
+            IMGFMT_GENERIC=false
+            xpand=false
+            ;;
+
+        -cloop)
+            IMGFMT=cloop
+            IMGFMT_GENERIC=false
+            xpand=false
+            ;;
+
+        -parallels)
+            IMGFMT=parallels
+            IMGFMT_GENERIC=false
             xpand=false
             ;;
 
@@ -211,22 +228,41 @@ testlist options
             xpand=false
             ;;
 
+        -file)
+            IMGPROTO=file
+            xpand=false
+            ;;
+
         -rbd)
             IMGPROTO=rbd
             xpand=false
             ;;
+
         -sheepdog)
             IMGPROTO=sheepdog
             xpand=false
             ;;
+
         -nbd)
             IMGPROTO=nbd
             xpand=false
             ;;
+
         -ssh)
             IMGPROTO=ssh
             xpand=false
             ;;
+
+        -nfs)
+            IMGPROTO=nfs
+            xpand=false
+            ;;
+
+        -archipelago)
+            IMGPROTO=archipelago
+            xpand=false
+            ;;
+
         -nocache)
             CACHEMODE="none"
             CACHEMODE_IS_DEFAULT=false
@@ -238,10 +274,10 @@ testlist options
             xpand=false
             ;;
 
-    -valgrind)
-        valgrind=true
+        -valgrind)
+            valgrind=true
             xpand=false
-        ;;
+            ;;
 
         -g)        # -g group ... pick from group file
             group=true
@@ -253,10 +289,10 @@ testlist options
 
             if [ ! -z "$DISPLAY" ]
             then
-                which xdiff >/dev/null 2>&1 && diff=xdiff
-                which gdiff >/dev/null 2>&1 && diff=gdiff
-                which tkdiff >/dev/null 2>&1 && diff=tkdiff
-                which xxdiff >/dev/null 2>&1 && diff=xxdiff
+                command -v xdiff >/dev/null 2>&1 && diff=xdiff
+                command -v gdiff >/dev/null 2>&1 && diff=gdiff
+                command -v tkdiff >/dev/null 2>&1 && diff=tkdiff
+                command -v xxdiff >/dev/null 2>&1 && diff=xxdiff
             fi
             ;;
 
@@ -329,7 +365,7 @@ testlist options
 BEGIN        { for (t='$start'; t<='$end'; t++) printf "%03d\n",t }' \
         | while read id
         do
-            if grep -s "^$id " group >/dev/null
+            if grep -s "^$id " "$source_iotests/group" >/dev/null
             then
                 # in group file ... OK
                 echo $id >>$tmp.list
@@ -340,16 +376,22 @@ BEGIN        { for (t='$start'; t<='$end'; t++) printf "%03d\n",t }' \
                     echo $id >>$tmp.list
                 else
                     # oops
-                    echo "$id - unknown test, ignored"
+                    if [ "$start" == "$end" -a "$id" == "$end" ]
+                    then
+                        echo "$id - unknown test"
+                        exit 1
+                    else
+                        echo "$id - unknown test, ignored"
+                    fi
                 fi
             fi
-        done
+        done || exit 1
     fi
 
 done
 
 # Set qemu-io cache mode with $CACHEMODE we have
-QEMU_IO_OPTIONS="$QEMU_IO_OPTIONS --cache $CACHEMODE"
+QEMU_IO_OPTIONS="$QEMU_IO_OPTIONS -f $IMGFMT --cache $CACHEMODE"
 
 # Set default options for qemu-img create -o if they were not specified
 _set_default_imgopts
@@ -365,7 +407,7 @@ else
         touch $tmp.list
     else
         # no test numbers, do everything from group file
-        sed -n -e '/^[0-9][0-9][0-9]*/s/[         ].*//p' <group >$tmp.list
+        sed -n -e '/^[0-9][0-9][0-9]*/s/[         ].*//p' <"$source_iotests/group" >$tmp.list
     fi
 fi
 

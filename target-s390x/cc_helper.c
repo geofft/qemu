@@ -19,7 +19,7 @@
  */
 
 #include "cpu.h"
-#include "helper.h"
+#include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
 
 /* #define DEBUG_HELPER */
@@ -179,16 +179,11 @@ static uint32_t cc_calc_subu_64(uint64_t a1, uint64_t a2, uint64_t ar)
 
 static uint32_t cc_calc_subb_64(uint64_t a1, uint64_t a2, uint64_t ar)
 {
-    /* We had borrow-in if normal subtraction isn't equal.  */
-    int borrow_in = ar - (a1 - a2);
     int borrow_out;
 
-    /* If a2 was ULONG_MAX, and borrow_in, then a2 is logically 65 bits,
-       and we must have had borrow out.  */
-    if (borrow_in && a2 == (uint64_t)-1) {
-        borrow_out = 1;
+    if (ar != a1 - a2) {	/* difference means borrow-in */
+        borrow_out = (a2 >= a1);
     } else {
-        a2 += borrow_in;
         borrow_out = (a2 > a1);
     }
 
@@ -285,16 +280,11 @@ static uint32_t cc_calc_subu_32(uint32_t a1, uint32_t a2, uint32_t ar)
 
 static uint32_t cc_calc_subb_32(uint32_t a1, uint32_t a2, uint32_t ar)
 {
-    /* We had borrow-in if normal subtraction isn't equal.  */
-    int borrow_in = ar - (a1 - a2);
     int borrow_out;
 
-    /* If a2 was UINT_MAX, and borrow_in, then a2 is logically 65 bits,
-       and we must have had borrow out.  */
-    if (borrow_in && a2 == (uint32_t)-1) {
-        borrow_out = 1;
+    if (ar != a1 - a2) {	/* difference means borrow-in */
+        borrow_out = (a2 >= a1);
     } else {
-        a2 += borrow_in;
         borrow_out = (a2 > a1);
     }
 
@@ -407,6 +397,7 @@ static uint32_t cc_calc_flogr(uint64_t dst)
 static uint32_t do_calc_cc(CPUS390XState *env, uint32_t cc_op,
                                   uint64_t src, uint64_t dst, uint64_t vr)
 {
+    S390CPU *cpu = s390_env_get_cpu(env);
     uint32_t r = 0;
 
     switch (cc_op) {
@@ -524,7 +515,7 @@ static uint32_t do_calc_cc(CPUS390XState *env, uint32_t cc_op,
         break;
 
     default:
-        cpu_abort(env, "Unknown CC operation: %s\n", cc_name(cc_op));
+        cpu_abort(CPU(cpu), "Unknown CC operation: %s\n", cc_name(cc_op));
     }
 
     HELPER_LOG("%s: %15s 0x%016lx 0x%016lx 0x%016lx = %d\n", __func__,
@@ -548,7 +539,7 @@ uint32_t HELPER(calc_cc)(CPUS390XState *env, uint32_t cc_op, uint64_t src,
 void HELPER(load_psw)(CPUS390XState *env, uint64_t mask, uint64_t addr)
 {
     load_psw(env, mask, addr);
-    cpu_loop_exit(env);
+    cpu_loop_exit(CPU(s390_env_get_cpu(env)));
 }
 
 void HELPER(sacf)(CPUS390XState *env, uint64_t a1)

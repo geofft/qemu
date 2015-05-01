@@ -20,8 +20,6 @@
 #include "qemu/osdep.h"
 #include "block/coroutine.h"
 #include "trace.h"
-#include "block/block_int.h"
-#include "qemu/event_notifier.h"
 #include "block/thread-pool.h"
 #include "qemu/main-loop.h"
 
@@ -33,11 +31,10 @@ enum ThreadState {
     THREAD_QUEUED,
     THREAD_ACTIVE,
     THREAD_DONE,
-    THREAD_CANCELED,
 };
 
 struct ThreadPoolElement {
-    BlockDriverAIOCB common;
+    BlockAIOCB common;
     ThreadPool *pool;
     ThreadPoolFunc *func;
     void *arg;
@@ -57,10 +54,9 @@ struct ThreadPoolElement {
 };
 
 struct ThreadPool {
-    EventNotifier notifier;
     AioContext *ctx;
+    QEMUBH *completion_bh;
     QemuMutex lock;
-    QemuCond check_cancel;
     QemuCond worker_stopped;
     QemuSemaphore sem;
     int max_threads;
@@ -75,7 +71,6 @@ struct ThreadPool {
     int idle_threads;
     int new_threads;     /* backlog of threads we need to create */
     int pending_threads; /* threads created but not running yet */
-    int pending_cancellations; /* whether we need a cond_broadcast */
     bool stopping;
 };
 
@@ -115,11 +110,8 @@ static void *worker_thread(void *opaque)
         req->state = THREAD_DONE;
 
         qemu_mutex_lock(&pool->lock);
-        if (pool->pending_cancellations) {
-            qemu_cond_broadcast(&pool->check_cancel);
-        }
 
-        event_notifier_set(&pool->notifier);
+        qemu_bh_schedule(pool->completion_bh);
     }
 
     pool->cur_threads--;
@@ -140,7 +132,7 @@ static void do_spawn_thread(ThreadPool *pool)
     pool->new_threads--;
     pool->pending_threads++;
 
-    qemu_thread_create(&t, worker_thread, pool, QEMU_THREAD_DETACHED);
+    qemu_thread_create(&t, "worker", worker_thread, pool, QEMU_THREAD_DETACHED);
 }
 
 static void spawn_thread_bh_fn(void *opaque)
@@ -168,15 +160,14 @@ static void spawn_thread(ThreadPool *pool)
     }
 }
 
-static void event_notifier_ready(EventNotifier *notifier)
+static void thread_pool_completion_bh(void *opaque)
 {
-    ThreadPool *pool = container_of(notifier, ThreadPool, notifier);
+    ThreadPool *pool = opaque;
     ThreadPoolElement *elem, *next;
 
-    event_notifier_test_and_clear(notifier);
 restart:
     QLIST_FOREACH_SAFE(elem, &pool->head, all, next) {
-        if (elem->state != THREAD_CANCELED && elem->state != THREAD_DONE) {
+        if (elem->state != THREAD_DONE) {
             continue;
         }
         if (elem->state == THREAD_DONE) {
@@ -187,18 +178,24 @@ restart:
             QLIST_REMOVE(elem, all);
             /* Read state before ret.  */
             smp_rmb();
+
+            /* Schedule ourselves in case elem->common.cb() calls aio_poll() to
+             * wait for another request that completed at the same time.
+             */
+            qemu_bh_schedule(pool->completion_bh);
+
             elem->common.cb(elem->common.opaque, elem->ret);
-            qemu_aio_release(elem);
+            qemu_aio_unref(elem);
             goto restart;
         } else {
             /* remove the request */
             QLIST_REMOVE(elem, all);
-            qemu_aio_release(elem);
+            qemu_aio_unref(elem);
         }
     }
 }
 
-static void thread_pool_cancel(BlockDriverAIOCB *acb)
+static void thread_pool_cancel(BlockAIOCB *acb)
 {
     ThreadPoolElement *elem = (ThreadPoolElement *)acb;
     ThreadPool *pool = elem->pool;
@@ -214,26 +211,31 @@ static void thread_pool_cancel(BlockDriverAIOCB *acb)
          */
         qemu_sem_timedwait(&pool->sem, 0) == 0) {
         QTAILQ_REMOVE(&pool->request_list, elem, reqs);
-        elem->state = THREAD_CANCELED;
-        event_notifier_set(&pool->notifier);
-    } else {
-        pool->pending_cancellations++;
-        while (elem->state != THREAD_CANCELED && elem->state != THREAD_DONE) {
-            qemu_cond_wait(&pool->check_cancel, &pool->lock);
-        }
-        pool->pending_cancellations--;
+        qemu_bh_schedule(pool->completion_bh);
+
+        elem->state = THREAD_DONE;
+        elem->ret = -ECANCELED;
     }
+
     qemu_mutex_unlock(&pool->lock);
+}
+
+static AioContext *thread_pool_get_aio_context(BlockAIOCB *acb)
+{
+    ThreadPoolElement *elem = (ThreadPoolElement *)acb;
+    ThreadPool *pool = elem->pool;
+    return pool->ctx;
 }
 
 static const AIOCBInfo thread_pool_aiocb_info = {
     .aiocb_size         = sizeof(ThreadPoolElement),
-    .cancel             = thread_pool_cancel,
+    .cancel_async       = thread_pool_cancel,
+    .get_aio_context    = thread_pool_get_aio_context,
 };
 
-BlockDriverAIOCB *thread_pool_submit_aio(ThreadPool *pool,
+BlockAIOCB *thread_pool_submit_aio(ThreadPool *pool,
         ThreadPoolFunc *func, void *arg,
-        BlockDriverCompletionFunc *cb, void *opaque)
+        BlockCompletionFunc *cb, void *opaque)
 {
     ThreadPoolElement *req;
 
@@ -292,10 +294,9 @@ static void thread_pool_init_one(ThreadPool *pool, AioContext *ctx)
     }
 
     memset(pool, 0, sizeof(*pool));
-    event_notifier_init(&pool->notifier, false);
     pool->ctx = ctx;
+    pool->completion_bh = aio_bh_new(ctx, thread_pool_completion_bh, pool);
     qemu_mutex_init(&pool->lock);
-    qemu_cond_init(&pool->check_cancel);
     qemu_cond_init(&pool->worker_stopped);
     qemu_sem_init(&pool->sem, 0);
     pool->max_threads = 64;
@@ -303,8 +304,6 @@ static void thread_pool_init_one(ThreadPool *pool, AioContext *ctx)
 
     QLIST_INIT(&pool->head);
     QTAILQ_INIT(&pool->request_list);
-
-    aio_set_event_notifier(ctx, &pool->notifier, event_notifier_ready);
 }
 
 ThreadPool *thread_pool_new(AioContext *ctx)
@@ -338,11 +337,9 @@ void thread_pool_free(ThreadPool *pool)
 
     qemu_mutex_unlock(&pool->lock);
 
-    aio_set_event_notifier(pool->ctx, &pool->notifier, NULL);
+    qemu_bh_delete(pool->completion_bh);
     qemu_sem_destroy(&pool->sem);
-    qemu_cond_destroy(&pool->check_cancel);
     qemu_cond_destroy(&pool->worker_stopped);
     qemu_mutex_destroy(&pool->lock);
-    event_notifier_cleanup(&pool->notifier);
     g_free(pool);
 }

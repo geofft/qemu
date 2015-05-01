@@ -24,9 +24,12 @@
 #include "qemu-common.h"
 #include "qemu/host-utils.h"
 #include <math.h>
+#include <limits.h>
+#include <errno.h>
 
 #include "qemu/sockets.h"
 #include "qemu/iov.h"
+#include "net/net.h"
 
 void strpadcpy(char *buf, int buf_size, const char *str, char pad)
 {
@@ -456,11 +459,16 @@ int parse_uint_full(const char *s, unsigned long long *value, int base)
 
 int qemu_parse_fd(const char *param)
 {
-    int fd;
-    char *endptr = NULL;
+    long fd;
+    char *endptr;
 
+    errno = 0;
     fd = strtol(param, &endptr, 10);
-    if (*endptr || (fd == 0 && param == endptr)) {
+    if (param == endptr /* no conversion performed */                    ||
+        errno != 0      /* not representable as long; possibly others */ ||
+        *endptr != '\0' /* final string not empty */                     ||
+        fd < 0          /* invalid as file descriptor */                 ||
+        fd > INT_MAX    /* not representable as int */) {
         return -1;
     }
     return fd;
@@ -473,6 +481,20 @@ int64_t pow2floor(int64_t value)
         value = 0x8000000000000000ULL >> clz64(value);
     }
     return value;
+}
+
+/* round up to the nearest power of 2 (0 if overflow) */
+uint64_t pow2ceil(uint64_t value)
+{
+    uint8_t nlz = clz64(value);
+
+    if (is_power_of_2(value)) {
+        return value;
+    }
+    if (!nlz) {
+        return 0;
+    }
+    return 1ULL << (64 - nlz);
 }
 
 /*
@@ -515,18 +537,32 @@ int parse_debug_env(const char *name, int max, int initial)
 {
     char *debug_env = getenv(name);
     char *inv = NULL;
-    int debug;
+    long debug;
 
     if (!debug_env) {
         return initial;
     }
+    errno = 0;
     debug = strtol(debug_env, &inv, 10);
     if (inv == debug_env) {
         return initial;
     }
-    if (debug < 0 || debug > max) {
+    if (debug < 0 || debug > max || errno != 0) {
         fprintf(stderr, "warning: %s not in [0, %d]", name, max);
         return initial;
     }
     return debug;
+}
+
+/*
+ * Helper to print ethernet mac address
+ */
+const char *qemu_ether_ntoa(const MACAddr *mac)
+{
+    static char ret[18];
+
+    snprintf(ret, sizeof(ret), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac->a[0], mac->a[1], mac->a[2], mac->a[3], mac->a[4], mac->a[5]);
+
+    return ret;
 }

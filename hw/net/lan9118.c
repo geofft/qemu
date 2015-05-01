@@ -727,14 +727,14 @@ static void tx_fifo_push(lan9118_state *s, uint32_t val)
         s->txp->cmd_a = val & 0x831f37ff;
         s->txp->fifo_used++;
         s->txp->state = TX_B;
+        s->txp->buffer_size = extract32(s->txp->cmd_a, 0, 11);
+        s->txp->offset = extract32(s->txp->cmd_a, 16, 5);
         break;
     case TX_B:
         if (s->txp->cmd_a & 0x2000) {
             /* First segment */
             s->txp->cmd_b = val;
             s->txp->fifo_used++;
-            s->txp->buffer_size = s->txp->cmd_a & 0x7ff;
-            s->txp->offset = (s->txp->cmd_a >> 16) & 0x1f;
             /* End alignment does not include command words.  */
             n = (s->txp->buffer_size + s->txp->offset + 3) >> 2;
             switch ((n >> 24) & 3) {
@@ -763,7 +763,7 @@ static void tx_fifo_push(lan9118_state *s, uint32_t val)
         if (s->txp->buffer_size <= 0 && s->txp->pad != 0) {
             s->txp->pad--;
         } else {
-            n = 4;
+            n = MIN(4, s->txp->buffer_size + s->txp->offset);
             while (s->txp->offset) {
                 val >>= 8;
                 n--;
@@ -1309,19 +1309,11 @@ static const MemoryRegionOps lan9118_16bit_mem_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static void lan9118_cleanup(NetClientState *nc)
-{
-    lan9118_state *s = qemu_get_nic_opaque(nc);
-
-    s->nic = NULL;
-}
-
 static NetClientInfo net_lan9118_info = {
     .type = NET_CLIENT_OPTIONS_KIND_NIC,
     .size = sizeof(NICState),
     .can_receive = lan9118_can_receive,
     .receive = lan9118_receive,
-    .cleanup = lan9118_cleanup,
     .link_status_changed = lan9118_set_link,
 };
 

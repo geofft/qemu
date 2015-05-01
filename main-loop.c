@@ -25,6 +25,7 @@
 #include "qemu-common.h"
 #include "qemu/timer.h"
 #include "qemu/sockets.h"	// struct in_addr needed for libslirp.h
+#include "sysemu/qtest.h"
 #include "slirp/libslirp.h"
 #include "qemu/main-loop.h"
 #include "block/aio.h"
@@ -83,6 +84,11 @@ static int qemu_signal_init(void)
     sigaddset(&set, SIGIO);
     sigaddset(&set, SIGALRM);
     sigaddset(&set, SIGBUS);
+    /* SIGINT cannot be handled via signalfd, so that ^C can be used
+     * to interrupt QEMU when it is being run under gdb.  SIGHUP and
+     * SIGTERM are also handled asynchronously, even though it is not
+     * strictly necessary, because they use the same handler as SIGINT.
+     */
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 
     sigdelset(&set, SIG_IPI);
@@ -125,10 +131,11 @@ void qemu_notify_event(void)
 
 static GArray *gpollfds;
 
-int qemu_init_main_loop(void)
+int qemu_init_main_loop(Error **errp)
 {
     int ret;
     GSource *src;
+    Error *local_error = NULL;
 
     init_clocks();
 
@@ -137,8 +144,12 @@ int qemu_init_main_loop(void)
         return ret;
     }
 
+    qemu_aio_context = aio_context_new(&local_error);
+    if (!qemu_aio_context) {
+        error_propagate(errp, local_error);
+        return -EMFILE;
+    }
     gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
-    qemu_aio_context = aio_context_new();
     src = aio_get_g_source(qemu_aio_context);
     g_source_attach(src, NULL);
     g_source_unref(src);
@@ -208,7 +219,7 @@ static int os_host_main_loop_wait(int64_t timeout)
     if (!timeout && (spin_counter > MAX_MAIN_LOOP_SPIN)) {
         static bool notified;
 
-        if (!notified) {
+        if (!notified && !qtest_enabled()) {
             fprintf(stderr,
                     "main-loop: WARNING: I/O thread spun for %d iterations\n",
                     MAX_MAIN_LOOP_SPIN);
@@ -496,25 +507,4 @@ int main_loop_wait(int nonblocking)
 QEMUBH *qemu_bh_new(QEMUBHFunc *cb, void *opaque)
 {
     return aio_bh_new(qemu_aio_context, cb, opaque);
-}
-
-bool qemu_aio_wait(void)
-{
-    return aio_poll(qemu_aio_context, true);
-}
-
-#ifdef CONFIG_POSIX
-void qemu_aio_set_fd_handler(int fd,
-                             IOHandler *io_read,
-                             IOHandler *io_write,
-                             void *opaque)
-{
-    aio_set_fd_handler(qemu_aio_context, fd, io_read, io_write, opaque);
-}
-#endif
-
-void qemu_aio_set_event_notifier(EventNotifier *notifier,
-                                 EventNotifierHandler *io_read)
-{
-    aio_set_event_notifier(qemu_aio_context, notifier, io_read);
 }

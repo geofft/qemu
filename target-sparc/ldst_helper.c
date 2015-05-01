@@ -18,7 +18,8 @@
  */
 
 #include "cpu.h"
-#include "helper.h"
+#include "exec/helper-proto.h"
+#include "exec/cpu_ldst.h"
 
 //#define DEBUG_MMU
 //#define DEBUG_MXCC
@@ -63,27 +64,6 @@
 
 #define QT0 (env->qt0)
 #define QT1 (env->qt1)
-
-#if !defined(CONFIG_USER_ONLY)
-static void QEMU_NORETURN do_unaligned_access(CPUSPARCState *env,
-                                              target_ulong addr, int is_write,
-                                              int is_user, uintptr_t retaddr);
-#include "exec/softmmu_exec.h"
-#define MMUSUFFIX _mmu
-#define ALIGNED_ONLY
-
-#define SHIFT 0
-#include "exec/softmmu_template.h"
-
-#define SHIFT 1
-#include "exec/softmmu_template.h"
-
-#define SHIFT 2
-#include "exec/softmmu_template.h"
-
-#define SHIFT 3
-#include "exec/softmmu_template.h"
-#endif
 
 #if defined(TARGET_SPARC64) && !defined(CONFIG_USER_ONLY)
 /* Calculates TSB pointer value for fault page size 8k or 64k */
@@ -141,6 +121,7 @@ static void replace_tlb_entry(SparcTLBEntry *tlb,
 
     /* flush page range if translation is valid */
     if (TTE_IS_VALID(tlb->tte)) {
+        CPUState *cs = CPU(sparc_env_get_cpu(env1));
 
         mask = 0xffffffffffffe000ULL;
         mask <<= 3 * ((tlb->tte >> 61) & 3);
@@ -149,7 +130,7 @@ static void replace_tlb_entry(SparcTLBEntry *tlb,
         va = tlb->tag & mask;
 
         for (offset = 0; offset < size; offset += TARGET_PAGE_SIZE) {
-            tlb_flush_page(env1, va + offset);
+            tlb_flush_page(cs, va + offset);
         }
     }
 
@@ -269,6 +250,7 @@ static void replace_tlb_1bit_lru(SparcTLBEntry *tlb,
 
 #endif
 
+#if defined(TARGET_SPARC64) || defined(CONFIG_USER_ONLY)
 static inline target_ulong address_mask(CPUSPARCState *env1, target_ulong addr)
 {
 #ifdef TARGET_SPARC64
@@ -278,12 +260,14 @@ static inline target_ulong address_mask(CPUSPARCState *env1, target_ulong addr)
 #endif
     return addr;
 }
+#endif
 
+#ifdef TARGET_SPARC64
 /* returns true if access using this ASI is to have address translated by MMU
    otherwise access is to raw physical address */
+/* TODO: check sparc32 bits */
 static inline int is_translating_asi(int asi)
 {
-#ifdef TARGET_SPARC64
     /* Ultrasparc IIi translating asi
        - note this list is defined by cpu implementation
     */
@@ -300,10 +284,6 @@ static inline int is_translating_asi(int asi)
     default:
         return 0;
     }
-#else
-    /* TODO: check sparc32 bits */
-    return 0;
-#endif
 }
 
 static inline target_ulong asi_address_mask(CPUSPARCState *env,
@@ -315,6 +295,7 @@ static inline target_ulong asi_address_mask(CPUSPARCState *env,
         return addr;
     }
 }
+#endif
 
 void helper_check_align(CPUSPARCState *env, target_ulong addr, uint32_t align)
 {
@@ -447,6 +428,7 @@ static uint64_t leon3_cache_control_ld(CPUSPARCState *env, target_ulong addr,
 uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
                        int sign)
 {
+    CPUState *cs = CPU(sparc_env_get_cpu(env));
     uint64_t ret = 0;
 #if defined(DEBUG_MXCC) || defined(DEBUG_ASI)
     uint32_t last_addr = addr;
@@ -583,6 +565,7 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
         }
         break;
     case 0xb: /* Supervisor data access */
+    case 0x80:
         switch (size) {
         case 1:
             ret = cpu_ldub_kernel(env, addr);
@@ -608,37 +591,37 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
     case 0x1c: /* LEON MMU passthrough */
         switch (size) {
         case 1:
-            ret = ldub_phys(addr);
+            ret = ldub_phys(cs->as, addr);
             break;
         case 2:
-            ret = lduw_phys(addr);
+            ret = lduw_phys(cs->as, addr);
             break;
         default:
         case 4:
-            ret = ldl_phys(addr);
+            ret = ldl_phys(cs->as, addr);
             break;
         case 8:
-            ret = ldq_phys(addr);
+            ret = ldq_phys(cs->as, addr);
             break;
         }
         break;
     case 0x21 ... 0x2f: /* MMU passthrough, 0x100000000 to 0xfffffffff */
         switch (size) {
         case 1:
-            ret = ldub_phys((hwaddr)addr
+            ret = ldub_phys(cs->as, (hwaddr)addr
                             | ((hwaddr)(asi & 0xf) << 32));
             break;
         case 2:
-            ret = lduw_phys((hwaddr)addr
+            ret = lduw_phys(cs->as, (hwaddr)addr
                             | ((hwaddr)(asi & 0xf) << 32));
             break;
         default:
         case 4:
-            ret = ldl_phys((hwaddr)addr
+            ret = ldl_phys(cs->as, (hwaddr)addr
                            | ((hwaddr)(asi & 0xf) << 32));
             break;
         case 8:
-            ret = ldq_phys((hwaddr)addr
+            ret = ldq_phys(cs->as, (hwaddr)addr
                            | ((hwaddr)(asi & 0xf) << 32));
             break;
         }
@@ -686,8 +669,7 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
         break;
     case 8: /* User code access, XXX */
     default:
-        cpu_unassigned_access(CPU(sparc_env_get_cpu(env)),
-                              addr, false, false, asi, size);
+        cpu_unassigned_access(cs, addr, false, false, asi, size);
         ret = 0;
         break;
     }
@@ -715,6 +697,9 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
 void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
                    int size)
 {
+    SPARCCPU *cpu = sparc_env_get_cpu(env);
+    CPUState *cs = CPU(cpu);
+
     helper_check_align(env, addr, size - 1);
     switch (asi) {
     case 2: /* SuperSparc MXCC registers and Leon3 cache control */
@@ -771,13 +756,17 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
                               "%08x: unimplemented access size: %d\n", addr,
                               size);
             }
-            env->mxccdata[0] = ldq_phys((env->mxccregs[0] & 0xffffffffULL) +
+            env->mxccdata[0] = ldq_phys(cs->as,
+                                        (env->mxccregs[0] & 0xffffffffULL) +
                                         0);
-            env->mxccdata[1] = ldq_phys((env->mxccregs[0] & 0xffffffffULL) +
+            env->mxccdata[1] = ldq_phys(cs->as,
+                                        (env->mxccregs[0] & 0xffffffffULL) +
                                         8);
-            env->mxccdata[2] = ldq_phys((env->mxccregs[0] & 0xffffffffULL) +
+            env->mxccdata[2] = ldq_phys(cs->as,
+                                        (env->mxccregs[0] & 0xffffffffULL) +
                                         16);
-            env->mxccdata[3] = ldq_phys((env->mxccregs[0] & 0xffffffffULL) +
+            env->mxccdata[3] = ldq_phys(cs->as,
+                                        (env->mxccregs[0] & 0xffffffffULL) +
                                         24);
             break;
         case 0x01c00200: /* MXCC stream destination */
@@ -788,13 +777,13 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
                               "%08x: unimplemented access size: %d\n", addr,
                               size);
             }
-            stq_phys((env->mxccregs[1] & 0xffffffffULL) +  0,
+            stq_phys(cs->as, (env->mxccregs[1] & 0xffffffffULL) +  0,
                      env->mxccdata[0]);
-            stq_phys((env->mxccregs[1] & 0xffffffffULL) +  8,
+            stq_phys(cs->as, (env->mxccregs[1] & 0xffffffffULL) +  8,
                      env->mxccdata[1]);
-            stq_phys((env->mxccregs[1] & 0xffffffffULL) + 16,
+            stq_phys(cs->as, (env->mxccregs[1] & 0xffffffffULL) + 16,
                      env->mxccdata[2]);
-            stq_phys((env->mxccregs[1] & 0xffffffffULL) + 24,
+            stq_phys(cs->as, (env->mxccregs[1] & 0xffffffffULL) + 24,
                      env->mxccdata[3]);
             break;
         case 0x01c00a00: /* MXCC control register */
@@ -856,13 +845,13 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
             DPRINTF_MMU("mmu flush level %d\n", mmulev);
             switch (mmulev) {
             case 0: /* flush page */
-                tlb_flush_page(env, addr & 0xfffff000);
+                tlb_flush_page(CPU(cpu), addr & 0xfffff000);
                 break;
             case 1: /* flush segment (256k) */
             case 2: /* flush region (16M) */
             case 3: /* flush context (4G) */
             case 4: /* flush entire */
-                tlb_flush(env, 1);
+                tlb_flush(CPU(cpu), 1);
                 break;
             default:
                 break;
@@ -887,7 +876,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
                    disabled mode are invalid in normal mode */
                 if ((oldreg & (MMU_E | MMU_NF | env->def->mmu_bm)) !=
                     (env->mmuregs[reg] & (MMU_E | MMU_NF | env->def->mmu_bm))) {
-                    tlb_flush(env, 1);
+                    tlb_flush(CPU(cpu), 1);
                 }
                 break;
             case 1: /* Context Table Pointer Register */
@@ -898,7 +887,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
                 if (oldreg != env->mmuregs[reg]) {
                     /* we flush when the MMU context changes because
                        QEMU has no MMU context support */
-                    tlb_flush(env, 1);
+                    tlb_flush(CPU(cpu), 1);
                 }
                 break;
             case 3: /* Synchronous Fault Status Register with Clear */
@@ -949,6 +938,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
         }
         break;
     case 0xb: /* Supervisor data access */
+    case 0x80:
         switch (size) {
         case 1:
             cpu_stb_kernel(env, addr, val);
@@ -1006,17 +996,17 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
         {
             switch (size) {
             case 1:
-                stb_phys(addr, val);
+                stb_phys(cs->as, addr, val);
                 break;
             case 2:
-                stw_phys(addr, val);
+                stw_phys(cs->as, addr, val);
                 break;
             case 4:
             default:
-                stl_phys(addr, val);
+                stl_phys(cs->as, addr, val);
                 break;
             case 8:
-                stq_phys(addr, val);
+                stq_phys(cs->as, addr, val);
                 break;
             }
         }
@@ -1025,20 +1015,20 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, uint64_t val, int asi,
         {
             switch (size) {
             case 1:
-                stb_phys((hwaddr)addr
+                stb_phys(cs->as, (hwaddr)addr
                          | ((hwaddr)(asi & 0xf) << 32), val);
                 break;
             case 2:
-                stw_phys((hwaddr)addr
+                stw_phys(cs->as, (hwaddr)addr
                          | ((hwaddr)(asi & 0xf) << 32), val);
                 break;
             case 4:
             default:
-                stl_phys((hwaddr)addr
+                stl_phys(cs->as, (hwaddr)addr
                          | ((hwaddr)(asi & 0xf) << 32), val);
                 break;
             case 8:
-                stq_phys((hwaddr)addr
+                stq_phys(cs->as, (hwaddr)addr
                          | ((hwaddr)(asi & 0xf) << 32), val);
                 break;
             }
@@ -1132,17 +1122,17 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
         {
             switch (size) {
             case 1:
-                ret = ldub_raw(addr);
+                ret = cpu_ldub_data(env, addr);
                 break;
             case 2:
-                ret = lduw_raw(addr);
+                ret = cpu_lduw_data(env, addr);
                 break;
             case 4:
-                ret = ldl_raw(addr);
+                ret = cpu_ldl_data(env, addr);
                 break;
             default:
             case 8:
-                ret = ldq_raw(addr);
+                ret = cpu_ldq_data(env, addr);
                 break;
             }
         }
@@ -1249,17 +1239,17 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
         {
             switch (size) {
             case 1:
-                stb_raw(addr, val);
+                cpu_stb_data(env, addr, val);
                 break;
             case 2:
-                stw_raw(addr, val);
+                cpu_stw_data(env, addr, val);
                 break;
             case 4:
-                stl_raw(addr, val);
+                cpu_stl_data(env, addr, val);
                 break;
             case 8:
             default:
-                stq_raw(addr, val);
+                cpu_stq_data(env, addr, val);
                 break;
             }
         }
@@ -1284,6 +1274,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
 uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
                        int sign)
 {
+    CPUState *cs = CPU(sparc_env_get_cpu(env));
     uint64_t ret = 0;
 #if defined(DEBUG_ASI)
     target_ulong last_addr = addr;
@@ -1317,7 +1308,7 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
             dump_asi("read ", last_addr, asi, size, ret);
 #endif
             /* env->exception_index is set in get_physical_address_data(). */
-            helper_raise_exception(env, env->exception_index);
+            helper_raise_exception(env, cs->exception_index);
         }
 
         /* convert nonfaulting load ASIs to normal load ASIs */
@@ -1432,17 +1423,17 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
         {
             switch (size) {
             case 1:
-                ret = ldub_phys(addr);
+                ret = ldub_phys(cs->as, addr);
                 break;
             case 2:
-                ret = lduw_phys(addr);
+                ret = lduw_phys(cs->as, addr);
                 break;
             case 4:
-                ret = ldl_phys(addr);
+                ret = ldl_phys(cs->as, addr);
                 break;
             default:
             case 8:
-                ret = ldq_phys(addr);
+                ret = ldq_phys(cs->as, addr);
                 break;
             }
             break;
@@ -1596,8 +1587,7 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
     case 0x5f: /* D-MMU demap, WO */
     case 0x77: /* Interrupt vector, WO */
     default:
-        cpu_unassigned_access(CPU(sparc_env_get_cpu(env)),
-                              addr, false, false, 1, size);
+        cpu_unassigned_access(cs, addr, false, false, 1, size);
         ret = 0;
         break;
     }
@@ -1653,6 +1643,9 @@ uint64_t helper_ld_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
 void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
                    int asi, int size)
 {
+    SPARCCPU *cpu = sparc_env_get_cpu(env);
+    CPUState *cs = CPU(cpu);
+
 #ifdef DEBUG_ASI
     dump_asi("write", addr, asi, size, val);
 #endif
@@ -1803,17 +1796,17 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
         {
             switch (size) {
             case 1:
-                stb_phys(addr, val);
+                stb_phys(cs->as, addr, val);
                 break;
             case 2:
-                stw_phys(addr, val);
+                stw_phys(cs->as, addr, val);
                 break;
             case 4:
-                stl_phys(addr, val);
+                stl_phys(cs->as, addr, val);
                 break;
             case 8:
             default:
-                stq_phys(addr, val);
+                stq_phys(cs->as, addr, val);
                 break;
             }
         }
@@ -1861,7 +1854,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
 #ifdef DEBUG_MMU
                 dump_mmu(stdout, fprintf, env);
 #endif
-                tlb_flush(env, 1);
+                tlb_flush(CPU(cpu), 1);
             }
             return;
         }
@@ -1950,13 +1943,13 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
                 env->dmmu.mmu_primary_context = val;
                 /* can be optimized to only flush MMU_USER_IDX
                    and MMU_KERNEL_IDX entries */
-                tlb_flush(env, 1);
+                tlb_flush(CPU(cpu), 1);
                 break;
             case 2: /* Secondary context */
                 env->dmmu.mmu_secondary_context = val;
                 /* can be optimized to only flush MMU_USER_SECONDARY_IDX
                    and MMU_KERNEL_SECONDARY_IDX entries */
-                tlb_flush(env, 1);
+                tlb_flush(CPU(cpu), 1);
                 break;
             case 5: /* TSB access */
                 DPRINTF_MMU("dmmu TSB write: 0x%016" PRIx64 " -> 0x%016"
@@ -2030,8 +2023,7 @@ void helper_st_asi(CPUSPARCState *env, target_ulong addr, target_ulong val,
     case 0x8a: /* Primary no-fault LE, RO */
     case 0x8b: /* Secondary no-fault LE, RO */
     default:
-        cpu_unassigned_access(CPU(sparc_env_get_cpu(env)),
-                              addr, true, false, 1, size);
+        cpu_unassigned_access(cs, addr, true, false, 1, size);
         return;
     }
 }
@@ -2162,7 +2154,6 @@ void helper_stf_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
     unsigned int i;
     target_ulong val;
 
-    helper_check_align(env, addr, 3);
     addr = asi_address_mask(env, asi, addr);
 
     switch (asi) {
@@ -2200,7 +2191,21 @@ void helper_stf_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
         }
 
         return;
+    case 0xd2: /* 16-bit floating point load primary */
+    case 0xd3: /* 16-bit floating point load secondary */
+    case 0xda: /* 16-bit floating point load primary, LE */
+    case 0xdb: /* 16-bit floating point load secondary, LE */
+        helper_check_align(env, addr, 1);
+        /* Fall through */
+    case 0xd0: /* 8-bit floating point load primary */
+    case 0xd1: /* 8-bit floating point load secondary */
+    case 0xd8: /* 8-bit floating point load primary, LE */
+    case 0xd9: /* 8-bit floating point load secondary, LE */
+        val = env->fpr[rd / 2].l.lower;
+        helper_st_asi(env, addr, val, asi & 0x8d, ((asi & 2) >> 1) + 1);
+        return;
     default:
+        helper_check_align(env, addr, 3);
         break;
     }
 
@@ -2224,20 +2229,6 @@ void helper_stf_asi(CPUSPARCState *env, target_ulong addr, int asi, int size,
     }
 }
 
-target_ulong helper_cas_asi(CPUSPARCState *env, target_ulong addr,
-                            target_ulong val1, target_ulong val2, uint32_t asi)
-{
-    target_ulong ret;
-
-    val2 &= 0xffffffffUL;
-    ret = helper_ld_asi(env, addr, asi, 4, 0);
-    ret &= 0xffffffffUL;
-    if (val2 == ret) {
-        helper_st_asi(env, addr, val1 & 0xffffffffUL, asi, 4);
-    }
-    return ret;
-}
-
 target_ulong helper_casx_asi(CPUSPARCState *env, target_ulong addr,
                              target_ulong val1, target_ulong val2,
                              uint32_t asi)
@@ -2251,6 +2242,22 @@ target_ulong helper_casx_asi(CPUSPARCState *env, target_ulong addr,
     return ret;
 }
 #endif /* TARGET_SPARC64 */
+
+#if !defined(CONFIG_USER_ONLY) || defined(TARGET_SPARC64)
+target_ulong helper_cas_asi(CPUSPARCState *env, target_ulong addr,
+                            target_ulong val1, target_ulong val2, uint32_t asi)
+{
+    target_ulong ret;
+
+    val2 &= 0xffffffffUL;
+    ret = helper_ld_asi(env, addr, asi, 4, 0);
+    ret &= 0xffffffffUL;
+    if (val2 == ret) {
+        helper_st_asi(env, addr, val1 & 0xffffffffUL, asi, 4);
+    }
+    return ret;
+}
+#endif /* !defined(CONFIG_USER_ONLY) || defined(TARGET_SPARC64) */
 
 void helper_ldqf(CPUSPARCState *env, target_ulong addr, int mem_idx)
 {
@@ -2282,8 +2289,8 @@ void helper_ldqf(CPUSPARCState *env, target_ulong addr, int mem_idx)
         break;
     }
 #else
-    u.ll.upper = ldq_raw(address_mask(env, addr));
-    u.ll.lower = ldq_raw(address_mask(env, addr + 8));
+    u.ll.upper = cpu_ldq_data(env, address_mask(env, addr));
+    u.ll.lower = cpu_ldq_data(env, address_mask(env, addr + 8));
     QT0 = u.q;
 #endif
 }
@@ -2319,8 +2326,8 @@ void helper_stqf(CPUSPARCState *env, target_ulong addr, int mem_idx)
     }
 #else
     u.q = QT0;
-    stq_raw(address_mask(env, addr), u.ll.upper);
-    stq_raw(address_mask(env, addr + 8), u.ll.lower);
+    cpu_stq_data(env, address_mask(env, addr), u.ll.upper);
+    cpu_stq_data(env, address_mask(env, addr + 8), u.ll.lower);
 #endif
 }
 
@@ -2385,7 +2392,7 @@ void sparc_cpu_unassigned_access(CPUState *cs, hwaddr addr,
     /* flush neverland mappings created during no-fault mode,
        so the sequential MMU faults report proper fault types */
     if (env->mmuregs[0] & MMU_NF) {
-        tlb_flush(env, 1);
+        tlb_flush(cs, 1);
     }
 }
 #else
@@ -2411,16 +2418,19 @@ void sparc_cpu_unassigned_access(CPUState *cs, hwaddr addr,
 #endif
 
 #if !defined(CONFIG_USER_ONLY)
-static void QEMU_NORETURN do_unaligned_access(CPUSPARCState *env,
-                                              target_ulong addr, int is_write,
-                                              int is_user, uintptr_t retaddr)
+void QEMU_NORETURN sparc_cpu_do_unaligned_access(CPUState *cs,
+                                                 vaddr addr, int is_write,
+                                                 int is_user, uintptr_t retaddr)
 {
+    SPARCCPU *cpu = SPARC_CPU(cs);
+    CPUSPARCState *env = &cpu->env;
+
 #ifdef DEBUG_UNALIGNED
     printf("Unaligned access to 0x" TARGET_FMT_lx " from 0x" TARGET_FMT_lx
            "\n", addr, env->pc);
 #endif
     if (retaddr) {
-        cpu_restore_state(env, retaddr);
+        cpu_restore_state(CPU(cpu), retaddr);
     }
     helper_raise_exception(env, TT_UNALIGNED);
 }
@@ -2429,17 +2439,17 @@ static void QEMU_NORETURN do_unaligned_access(CPUSPARCState *env,
    NULL, it means that the function was called in C code (i.e. not
    from generated code or from helper.c) */
 /* XXX: fix it to restore all registers */
-void tlb_fill(CPUSPARCState *env, target_ulong addr, int is_write, int mmu_idx,
+void tlb_fill(CPUState *cs, target_ulong addr, int is_write, int mmu_idx,
               uintptr_t retaddr)
 {
     int ret;
 
-    ret = cpu_sparc_handle_mmu_fault(env, addr, is_write, mmu_idx);
+    ret = sparc_cpu_handle_mmu_fault(cs, addr, is_write, mmu_idx);
     if (ret) {
         if (retaddr) {
-            cpu_restore_state(env, retaddr);
+            cpu_restore_state(cs, retaddr);
         }
-        cpu_loop_exit(env);
+        cpu_loop_exit(cs);
     }
 }
 #endif

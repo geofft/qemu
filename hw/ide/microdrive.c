@@ -25,7 +25,7 @@
 #include <hw/hw.h>
 #include <hw/i386/pc.h>
 #include <hw/pcmcia.h>
-#include "block/block.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/dma.h"
 
 #include <hw/ide/internal.h>
@@ -247,7 +247,7 @@ static uint16_t md_common_read(PCMCIACardState *card, uint32_t at)
         return ide_ioport_read(&s->bus, 0x1);
     case 0xe:	/* Alternate Status */
         ifs = idebus_active_if(&s->bus);
-        if (ifs->bs) {
+        if (ifs->blk) {
             return ifs->status;
         } else {
             return 0;
@@ -332,8 +332,7 @@ static const VMStateDescription vmstate_microdrive = {
     .name = "microdrive",
     .version_id = 3,
     .minimum_version_id = 0,
-    .minimum_version_id_old = 0,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT8(opt, MicroDriveState),
         VMSTATE_UINT8(stat, MicroDriveState),
         VMSTATE_UINT8(pins, MicroDriveState),
@@ -544,7 +543,6 @@ static int dscm1xxxx_attach(PCMCIACardState *card)
     device_reset(DEVICE(md));
     md_interrupt_update(md);
 
-    card->slot->card_string = "DSCM-1xxxx Hitachi Microdrive";
     return 0;
 }
 
@@ -568,7 +566,7 @@ PCMCIACardState *dscm1xxxx_init(DriveInfo *dinfo)
     }
     md->bus.ifs[0].drive_kind = IDE_CFATA;
     md->bus.ifs[0].mdata_size = METADATA_SIZE;
-    md->bus.ifs[0].mdata_storage = (uint8_t *) g_malloc0(METADATA_SIZE);
+    md->bus.ifs[0].mdata_storage = g_malloc0(METADATA_SIZE);
 
     return PCMCIA_CARD(md);
 }
@@ -594,7 +592,7 @@ static void microdrive_realize(DeviceState *dev, Error **errp)
 {
     MicroDriveState *md = MICRODRIVE(dev);
 
-    ide_init2(&md->bus, qemu_allocate_irqs(md_set_irq, md, 1)[0]);
+    ide_init2(&md->bus, qemu_allocate_irq(md_set_irq, md, 0));
 }
 
 static void microdrive_init(Object *obj)

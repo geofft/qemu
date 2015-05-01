@@ -17,11 +17,12 @@
 #include "virtio-9p-xattr.h"
 #include "fsdev/qemu-fsdev.h"
 #include "virtio-9p-synth.h"
-
+#include "qemu/rcu.h"
+#include "qemu/rcu_queue.h"
 #include <sys/stat.h>
 
 /* Root node for synth file system */
-V9fsSynthNode v9fs_synth_root = {
+static V9fsSynthNode v9fs_synth_root = {
     .name = "/",
     .actual_attr = {
         .mode = 0555 | S_IFDIR,

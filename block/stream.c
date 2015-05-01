@@ -32,7 +32,7 @@ typedef struct StreamBlockJob {
     RateLimit limit;
     BlockDriverState *base;
     BlockdevOnError on_error;
-    char backing_file_id[1024];
+    char *backing_file_str;
 } StreamBlockJob;
 
 static int coroutine_fn stream_populate(BlockDriverState *bs,
@@ -60,7 +60,7 @@ static void close_unused_images(BlockDriverState *top, BlockDriverState *base,
     /* Must assign before bdrv_delete() to prevent traversing dangling pointer
      * while we delete backing image instances.
      */
-    top->backing_hd = base;
+    bdrv_set_backing_hd(top, base);
 
     while (intermediate) {
         BlockDriverState *unused;
@@ -72,14 +72,46 @@ static void close_unused_images(BlockDriverState *top, BlockDriverState *base,
 
         unused = intermediate;
         intermediate = intermediate->backing_hd;
-        unused->backing_hd = NULL;
+        bdrv_set_backing_hd(unused, NULL);
         bdrv_unref(unused);
     }
+
+    bdrv_refresh_limits(top, NULL);
+}
+
+typedef struct {
+    int ret;
+    bool reached_end;
+} StreamCompleteData;
+
+static void stream_complete(BlockJob *job, void *opaque)
+{
+    StreamBlockJob *s = container_of(job, StreamBlockJob, common);
+    StreamCompleteData *data = opaque;
+    BlockDriverState *base = s->base;
+
+    if (!block_job_is_cancelled(&s->common) && data->reached_end &&
+        data->ret == 0) {
+        const char *base_id = NULL, *base_fmt = NULL;
+        if (base) {
+            base_id = s->backing_file_str;
+            if (base->drv) {
+                base_fmt = base->drv->format_name;
+            }
+        }
+        data->ret = bdrv_change_backing_file(job->bs, base_id, base_fmt);
+        close_unused_images(job->bs, base, base_id);
+    }
+
+    g_free(s->backing_file_str);
+    block_job_completed(&s->common, data->ret);
+    g_free(data);
 }
 
 static void coroutine_fn stream_run(void *opaque)
 {
     StreamBlockJob *s = opaque;
+    StreamCompleteData *data;
     BlockDriverState *bs = s->common.bs;
     BlockDriverState *base = s->base;
     int64_t sector_num, end;
@@ -157,14 +189,14 @@ wait:
             BlockErrorAction action =
                 block_job_error_action(&s->common, s->common.bs, s->on_error,
                                        true, -ret);
-            if (action == BDRV_ACTION_STOP) {
+            if (action == BLOCK_ERROR_ACTION_STOP) {
                 n = 0;
                 continue;
             }
             if (error == 0) {
                 error = ret;
             }
-            if (action == BDRV_ACTION_REPORT) {
+            if (action == BLOCK_ERROR_ACTION_REPORT) {
                 break;
             }
         }
@@ -181,20 +213,13 @@ wait:
     /* Do not remove the backing file if an error was there but ignored.  */
     ret = error;
 
-    if (!block_job_is_cancelled(&s->common) && sector_num == end && ret == 0) {
-        const char *base_id = NULL, *base_fmt = NULL;
-        if (base) {
-            base_id = s->backing_file_id;
-            if (base->drv) {
-                base_fmt = base->drv->format_name;
-            }
-        }
-        ret = bdrv_change_backing_file(bs, base_id, base_fmt);
-        close_unused_images(bs, base, base_id);
-    }
-
     qemu_vfree(buf);
-    block_job_completed(&s->common, ret);
+
+    /* Modify backing chain and close BDSes in main loop */
+    data = g_malloc(sizeof(*data));
+    data->ret = ret;
+    data->reached_end = sector_num == end;
+    block_job_defer_to_main_loop(&s->common, stream_complete, data);
 }
 
 static void stream_set_speed(BlockJob *job, int64_t speed, Error **errp)
@@ -215,9 +240,9 @@ static const BlockJobDriver stream_job_driver = {
 };
 
 void stream_start(BlockDriverState *bs, BlockDriverState *base,
-                  const char *base_id, int64_t speed,
+                  const char *backing_file_str, int64_t speed,
                   BlockdevOnError on_error,
-                  BlockDriverCompletionFunc *cb,
+                  BlockCompletionFunc *cb,
                   void *opaque, Error **errp)
 {
     StreamBlockJob *s;
@@ -235,9 +260,7 @@ void stream_start(BlockDriverState *bs, BlockDriverState *base,
     }
 
     s->base = base;
-    if (base_id) {
-        pstrcpy(s->backing_file_id, sizeof(s->backing_file_id), base_id);
-    }
+    s->backing_file_str = g_strdup(backing_file_str);
 
     s->on_error = on_error;
     s->common.co = qemu_coroutine_create(stream_run);

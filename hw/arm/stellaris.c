@@ -29,6 +29,8 @@
 #define BP_OLED_SSI  0x02
 #define BP_GAMEPAD   0x04
 
+#define NUM_IRQ_LINES 64
+
 typedef const struct {
     const char *name;
     uint32_t did0;
@@ -185,12 +187,19 @@ static uint64_t gptm_read(void *opaque, hwaddr offset,
     case 0x44: /* TBPMR */
         return s->match_prescale[1];
     case 0x48: /* TAR */
-        if (s->control == 1)
+        if (s->config == 1) {
             return s->rtc;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "GPTM: read of TAR but timer read not supported");
+        return 0;
     case 0x4c: /* TBR */
-        hw_error("TODO: Timer value read\n");
+        qemu_log_mask(LOG_UNIMP,
+                      "GPTM: read of TBR but timer read not supported");
+        return 0;
     default:
-        hw_error("gptm_read: Bad offset 0x%x\n", (int)offset);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "GPTM: read at bad offset 0x%x\n", (int)offset);
         return 0;
     }
 }
@@ -286,8 +295,7 @@ static const VMStateDescription vmstate_stellaris_gptm = {
     .name = "stellaris_gptm",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(config, gptm_state),
         VMSTATE_UINT32_ARRAY(mode, gptm_state, 2),
         VMSTATE_UINT32(control, gptm_state),
@@ -300,7 +308,7 @@ static const VMStateDescription vmstate_stellaris_gptm = {
         VMSTATE_UINT32_ARRAY(match_prescale, gptm_state, 2),
         VMSTATE_UINT32(rtc, gptm_state),
         VMSTATE_INT64_ARRAY(tick, gptm_state, 2),
-        VMSTATE_TIMER_ARRAY(timer, gptm_state, 2),
+        VMSTATE_TIMER_PTR_ARRAY(timer, gptm_state, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -643,9 +651,8 @@ static const VMStateDescription vmstate_stellaris_sys = {
     .name = "stellaris_sys",
     .version_id = 2,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .post_load = stellaris_sys_post_load,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(pborctl, ssys_state),
         VMSTATE_UINT32(ldopctl, ssys_state),
         VMSTATE_UINT32(int_mask, ssys_state),
@@ -692,7 +699,7 @@ static int stellaris_sys_init(uint32_t base, qemu_irq irq,
 typedef struct {
     SysBusDevice parent_obj;
 
-    i2c_bus *bus;
+    I2CBus *bus;
     qemu_irq irq;
     MemoryRegion iomem;
     uint32_t msa;
@@ -851,8 +858,7 @@ static const VMStateDescription vmstate_stellaris_i2c = {
     .name = "stellaris_i2c",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(msa, stellaris_i2c_state),
         VMSTATE_UINT32(mcs, stellaris_i2c_state),
         VMSTATE_UINT32(mdr, stellaris_i2c_state),
@@ -868,7 +874,7 @@ static int stellaris_i2c_init(SysBusDevice *sbd)
 {
     DeviceState *dev = DEVICE(sbd);
     stellaris_i2c_state *s = STELLARIS_I2C(dev);
-    i2c_bus *bus;
+    I2CBus *bus;
 
     sysbus_init_irq(sbd, &s->irq);
     bus = i2c_init_bus(dev, "i2c");
@@ -1121,8 +1127,7 @@ static const VMStateDescription vmstate_stellaris_adc = {
     .name = "stellaris_adc",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(actss, stellaris_adc_state),
         VMSTATE_UINT32(ris, stellaris_adc_state),
         VMSTATE_UINT32(im, stellaris_adc_state),
@@ -1205,7 +1210,6 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
         0x40024000, 0x40025000, 0x40026000};
     static const int gpio_irq[7] = {0, 1, 2, 3, 4, 30, 31};
 
-    MemoryRegion *address_space_mem = get_system_memory();
     qemu_irq *pic;
     DeviceState *gpio_dev[7];
     qemu_irq gpio_in[7][8];
@@ -1213,15 +1217,32 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
     qemu_irq adc;
     int sram_size;
     int flash_size;
-    i2c_bus *i2c;
+    I2CBus *i2c;
     DeviceState *dev;
     int i;
     int j;
 
-    flash_size = ((board->dc0 & 0xffff) + 1) << 1;
-    sram_size = (board->dc0 >> 18) + 1;
-    pic = armv7m_init(address_space_mem,
-                      flash_size, sram_size, kernel_filename, cpu_model);
+    MemoryRegion *sram = g_new(MemoryRegion, 1);
+    MemoryRegion *flash = g_new(MemoryRegion, 1);
+    MemoryRegion *system_memory = get_system_memory();
+
+    flash_size = (((board->dc0 & 0xffff) + 1) << 1) * 1024;
+    sram_size = ((board->dc0 >> 18) + 1) * 1024;
+
+    /* Flash programming is done via the SCU, so pretend it is ROM.  */
+    memory_region_init_ram(flash, NULL, "stellaris.flash", flash_size,
+                           &error_abort);
+    vmstate_register_ram_global(flash);
+    memory_region_set_readonly(flash, true);
+    memory_region_add_subregion(system_memory, 0, flash);
+
+    memory_region_init_ram(sram, NULL, "stellaris.sram", sram_size,
+                           &error_abort);
+    vmstate_register_ram_global(sram);
+    memory_region_add_subregion(system_memory, 0x20000000, sram);
+
+    pic = armv7m_init(system_memory, flash_size, NUM_IRQ_LINES,
+                      kernel_filename, cpu_model);
 
     if (board->dc1 & (1 << 16)) {
         dev = sysbus_create_varargs(TYPE_STELLARIS_ADC, 0x40038000,
@@ -1256,7 +1277,7 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
 
     if (board->dc2 & (1 << 12)) {
         dev = sysbus_create_simple(TYPE_STELLARIS_I2C, 0x40020000, pic[8]);
-        i2c = (i2c_bus *)qdev_get_child_bus(dev, "i2c");
+        i2c = (I2CBus *)qdev_get_child_bus(dev, "i2c");
         if (board->peripherals & BP_OLED_I2C) {
             i2c_create_slave(i2c, "ssd0303", 0x3d);
         }
@@ -1287,9 +1308,10 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
 
             sddev = ssi_create_slave(bus, "ssi-sd");
             ssddev = ssi_create_slave(bus, "ssd0323");
-            gpio_out[GPIO_D][0] = qemu_irq_split(qdev_get_gpio_in(sddev, 0),
-                                                 qdev_get_gpio_in(ssddev, 0));
-            gpio_out[GPIO_C][7] = qdev_get_gpio_in(ssddev, 1);
+            gpio_out[GPIO_D][0] = qemu_irq_split(
+                    qdev_get_gpio_in_named(sddev, SSI_GPIO_CS, 0),
+                    qdev_get_gpio_in_named(ssddev, SSI_GPIO_CS, 0));
+            gpio_out[GPIO_C][7] = qdev_get_gpio_in(ssddev, 0);
 
             /* Make sure the select pin is high.  */
             qemu_irq_raise(gpio_out[GPIO_D][0]);
@@ -1330,17 +1352,17 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
 }
 
 /* FIXME: Figure out how to generate these from stellaris_boards.  */
-static void lm3s811evb_init(QEMUMachineInitArgs *args)
+static void lm3s811evb_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
     stellaris_init(kernel_filename, cpu_model, &stellaris_boards[0]);
 }
 
-static void lm3s6965evb_init(QEMUMachineInitArgs *args)
+static void lm3s6965evb_init(MachineState *machine)
 {
-    const char *cpu_model = args->cpu_model;
-    const char *kernel_filename = args->kernel_filename;
+    const char *cpu_model = machine->cpu_model;
+    const char *kernel_filename = machine->kernel_filename;
     stellaris_init(kernel_filename, cpu_model, &stellaris_boards[1]);
 }
 

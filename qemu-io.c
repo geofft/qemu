@@ -18,24 +18,27 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"
+#include "qemu/readline.h"
+#include "sysemu/block-backend.h"
 #include "block/block_int.h"
 #include "trace/control.h"
 
 #define CMD_NOFILE_OK   0x01
 
-char *progname;
+static char *progname;
 
-BlockDriverState *qemuio_bs;
-extern int qemuio_misalign;
+static BlockBackend *qemuio_blk;
 
 /* qemu-io commands passed using -c */
 static int ncmdline;
 static char **cmdline;
 
-static int close_f(BlockDriverState *bs, int argc, char **argv)
+static ReadLineState *readline_state;
+
+static int close_f(BlockBackend *blk, int argc, char **argv)
 {
-    bdrv_unref(bs);
-    qemuio_bs = NULL;
+    blk_unref(qemuio_blk);
+    qemuio_blk = NULL;
     return 0;
 }
 
@@ -46,33 +49,23 @@ static const cmdinfo_t close_cmd = {
     .oneline    = "close the current open file",
 };
 
-static int openfile(char *name, int flags, int growable, QDict *opts)
+static int openfile(char *name, int flags, QDict *opts)
 {
     Error *local_err = NULL;
 
-    if (qemuio_bs) {
+    if (qemuio_blk) {
         fprintf(stderr, "file open already, try 'help close'\n");
+        QDECREF(opts);
         return 1;
     }
 
-    if (growable) {
-        if (bdrv_file_open(&qemuio_bs, name, opts, flags, &local_err)) {
-            fprintf(stderr, "%s: can't open device %s: %s\n", progname, name,
-                    error_get_pretty(local_err));
-            error_free(local_err);
-            return 1;
-        }
-    } else {
-        qemuio_bs = bdrv_new("hda");
-
-        if (bdrv_open(qemuio_bs, name, opts, flags, NULL, &local_err) < 0) {
-            fprintf(stderr, "%s: can't open device %s: %s\n", progname, name,
-                    error_get_pretty(local_err));
-            error_free(local_err);
-            bdrv_unref(qemuio_bs);
-            qemuio_bs = NULL;
-            return 1;
-        }
+    qemuio_blk = blk_new_open("hda", name, NULL, opts, flags, &local_err);
+    if (!qemuio_blk) {
+        fprintf(stderr, "%s: can't open%s%s: %s\n", progname,
+                name ? " device " : "", name ?: "",
+                error_get_pretty(local_err));
+        error_free(local_err);
+        return 1;
     }
 
     return 0;
@@ -91,12 +84,11 @@ static void open_help(void)
 " -r, -- open file read-only\n"
 " -s, -- use snapshot file\n"
 " -n, -- disable host cache\n"
-" -g, -- allow file to grow (only applies to protocols)\n"
 " -o, -- options to be given to the block driver"
 "\n");
 }
 
-static int open_f(BlockDriverState *bs, int argc, char **argv);
+static int open_f(BlockBackend *blk, int argc, char **argv);
 
 static const cmdinfo_t open_cmd = {
     .name       = "open",
@@ -112,6 +104,7 @@ static const cmdinfo_t open_cmd = {
 
 static QemuOptsList empty_opts = {
     .name = "drive",
+    .merge_lists = true,
     .head = QTAILQ_HEAD_INITIALIZER(empty_opts.head),
     .desc = {
         /* no elements => accept any params */
@@ -119,14 +112,13 @@ static QemuOptsList empty_opts = {
     },
 };
 
-static int open_f(BlockDriverState *bs, int argc, char **argv)
+static int open_f(BlockBackend *blk, int argc, char **argv)
 {
     int flags = 0;
     int readonly = 0;
-    int growable = 0;
     int c;
     QemuOpts *qopts;
-    QDict *opts = NULL;
+    QDict *opts;
 
     while ((c = getopt(argc, argv, "snrgo:")) != EOF) {
         switch (c) {
@@ -139,19 +131,15 @@ static int open_f(BlockDriverState *bs, int argc, char **argv)
         case 'r':
             readonly = 1;
             break;
-        case 'g':
-            growable = 1;
-            break;
         case 'o':
-            qopts = qemu_opts_parse(&empty_opts, optarg, 0);
-            if (qopts == NULL) {
+            if (!qemu_opts_parse(&empty_opts, optarg, 0)) {
                 printf("could not parse option list -- %s\n", optarg);
+                qemu_opts_reset(&empty_opts);
                 return 0;
             }
-            opts = qemu_opts_to_qdict(qopts, opts);
-            qemu_opts_del(qopts);
             break;
         default:
+            qemu_opts_reset(&empty_opts);
             return qemuio_command_usage(&open_cmd);
         }
     }
@@ -160,14 +148,21 @@ static int open_f(BlockDriverState *bs, int argc, char **argv)
         flags |= BDRV_O_RDWR;
     }
 
-    if (optind != argc - 1) {
+    qopts = qemu_opts_find(&empty_opts, NULL);
+    opts = qopts ? qemu_opts_to_qdict(qopts, NULL) : NULL;
+    qemu_opts_reset(&empty_opts);
+
+    if (optind == argc - 1) {
+        return openfile(argv[optind], flags, opts);
+    } else if (optind == argc) {
+        return openfile(NULL, flags, opts);
+    } else {
+        QDECREF(opts);
         return qemuio_command_usage(&open_cmd);
     }
-
-    return openfile(argv[optind], flags, growable, opts);
 }
 
-static int quit_f(BlockDriverState *bs, int argc, char **argv)
+static int quit_f(BlockBackend *blk, int argc, char **argv)
 {
     return 1;
 }
@@ -185,31 +180,26 @@ static const cmdinfo_t quit_cmd = {
 static void usage(const char *name)
 {
     printf(
-"Usage: %s [-h] [-V] [-rsnm] [-c cmd] ... [file]\n"
+"Usage: %s [-h] [-V] [-rsnm] [-f FMT] [-c STRING] ... [file]\n"
 "QEMU Disk exerciser\n"
 "\n"
-"  -c, --cmd            command to execute\n"
+"  -c, --cmd STRING     execute command with its arguments\n"
+"                       from the given string\n"
+"  -f, --format FMT     specifies the block driver to use\n"
 "  -r, --read-only      export read-only\n"
 "  -s, --snapshot       use snapshot file\n"
 "  -n, --nocache        disable host cache\n"
-"  -g, --growable       allow file to grow (only applies to protocols)\n"
 "  -m, --misalign       misalign allocations for O_DIRECT\n"
 "  -k, --native-aio     use kernel AIO implementation (on Linux only)\n"
 "  -t, --cache=MODE     use the given cache mode for the image\n"
 "  -T, --trace FILE     enable trace events listed in the given file\n"
 "  -h, --help           display this help and exit\n"
 "  -V, --version        output version information and exit\n"
+"\n"
+"See '%s -c help' for information on available commands."
 "\n",
-    name);
+    name, name);
 }
-
-
-#if defined(ENABLE_READLINE)
-# include <readline/history.h>
-# include <readline/readline.h>
-#elif defined(ENABLE_EDITLINE)
-# include <histedit.h>
-#endif
 
 static char *get_prompt(void)
 {
@@ -222,52 +212,54 @@ static char *get_prompt(void)
     return prompt;
 }
 
-#if defined(ENABLE_READLINE)
-static char *fetchline(void)
+static void GCC_FMT_ATTR(2, 3) readline_printf_func(void *opaque,
+                                                    const char *fmt, ...)
 {
-    char *line = readline(get_prompt());
-    if (line && *line) {
-        add_history(line);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+}
+
+static void readline_flush_func(void *opaque)
+{
+    fflush(stdout);
+}
+
+static void readline_func(void *opaque, const char *str, void *readline_opaque)
+{
+    char **line = readline_opaque;
+    *line = g_strdup(str);
+}
+
+static void completion_match(const char *cmd, void *opaque)
+{
+    readline_add_completion(readline_state, cmd);
+}
+
+static void readline_completion_func(void *opaque, const char *str)
+{
+    readline_set_completion_index(readline_state, strlen(str));
+    qemuio_complete_command(str, completion_match, NULL);
+}
+
+static char *fetchline_readline(void)
+{
+    char *line = NULL;
+
+    readline_start(readline_state, get_prompt(), 0, readline_func, &line);
+    while (!line) {
+        int ch = getchar();
+        if (ch == EOF) {
+            break;
+        }
+        readline_handle_byte(readline_state, ch);
     }
     return line;
 }
-#elif defined(ENABLE_EDITLINE)
-static char *el_get_prompt(EditLine *e)
-{
-    return get_prompt();
-}
 
-static char *fetchline(void)
-{
-    static EditLine *el;
-    static History *hist;
-    HistEvent hevent;
-    char *line;
-    int count;
-
-    if (!el) {
-        hist = history_init();
-        history(hist, &hevent, H_SETSIZE, 100);
-        el = el_init(progname, stdin, stdout, stderr);
-        el_source(el, NULL);
-        el_set(el, EL_SIGNAL, 1);
-        el_set(el, EL_PROMPT, el_get_prompt);
-        el_set(el, EL_HIST, history, (const char *)hist);
-    }
-    line = strdup(el_gets(el, &count));
-    if (line) {
-        if (count > 0) {
-            line[count-1] = '\0';
-        }
-        if (*line) {
-            history(hist, &hevent, H_ENTER, line);
-        }
-    }
-    return line;
-}
-#else
-# define MAXREADLINESZ 1024
-static char *fetchline(void)
+#define MAXREADLINESZ 1024
+static char *fetchline_fgets(void)
 {
     char *p, *line = g_malloc(MAXREADLINESZ);
 
@@ -283,7 +275,15 @@ static char *fetchline(void)
 
     return line;
 }
-#endif
+
+static char *fetchline(void)
+{
+    if (readline_state) {
+        return fetchline_readline();
+    } else {
+        return fetchline_fgets();
+    }
+}
 
 static void prep_fetchline(void *opaque)
 {
@@ -299,7 +299,7 @@ static void command_loop(void)
     char *input;
 
     for (i = 0; !done && i < ncmdline; i++) {
-        done = qemuio_command(qemuio_bs, cmdline[i]);
+        done = qemuio_command(qemuio_blk, cmdline[i]);
     }
     if (cmdline) {
         g_free(cmdline);
@@ -324,7 +324,7 @@ static void command_loop(void)
         if (input == NULL) {
             break;
         }
-        done = qemuio_command(qemuio_bs, input);
+        done = qemuio_command(qemuio_blk, input);
         g_free(input);
 
         prompted = 0;
@@ -335,25 +335,29 @@ static void command_loop(void)
 
 static void add_user_command(char *optarg)
 {
-    cmdline = g_realloc(cmdline, ++ncmdline * sizeof(char *));
+    cmdline = g_renew(char *, cmdline, ++ncmdline);
     cmdline[ncmdline-1] = optarg;
+}
+
+static void reenable_tty_echo(void)
+{
+    qemu_set_tty_echo(STDIN_FILENO, true);
 }
 
 int main(int argc, char **argv)
 {
     int readonly = 0;
-    int growable = 0;
-    const char *sopt = "hVc:d:rsnmgkt:T:";
+    const char *sopt = "hVc:d:f:rsnmgkt:T:";
     const struct option lopt[] = {
         { "help", 0, NULL, 'h' },
         { "version", 0, NULL, 'V' },
         { "offset", 1, NULL, 'o' },
         { "cmd", 1, NULL, 'c' },
+        { "format", 1, NULL, 'f' },
         { "read-only", 0, NULL, 'r' },
         { "snapshot", 0, NULL, 's' },
         { "nocache", 0, NULL, 'n' },
         { "misalign", 0, NULL, 'm' },
-        { "growable", 0, NULL, 'g' },
         { "native-aio", 0, NULL, 'k' },
         { "discard", 1, NULL, 'd' },
         { "cache", 1, NULL, 't' },
@@ -363,12 +367,17 @@ int main(int argc, char **argv)
     int c;
     int opt_index = 0;
     int flags = BDRV_O_UNMAP;
+    Error *local_error = NULL;
+    QDict *opts = NULL;
 
 #ifdef CONFIG_POSIX
     signal(SIGPIPE, SIG_IGN);
 #endif
 
     progname = basename(argv[0]);
+    qemu_init_exec_dir(argv[0]);
+
+    bdrv_init();
 
     while ((c = getopt_long(argc, argv, sopt, lopt, &opt_index)) != -1) {
         switch (c) {
@@ -384,6 +393,12 @@ int main(int argc, char **argv)
                 exit(1);
             }
             break;
+        case 'f':
+            if (!opts) {
+                opts = qdict_new();
+            }
+            qdict_put(opts, "driver", qstring_from_str(optarg));
+            break;
         case 'c':
             add_user_command(optarg);
             break;
@@ -391,10 +406,7 @@ int main(int argc, char **argv)
             readonly = 1;
             break;
         case 'm':
-            qemuio_misalign = 1;
-            break;
-        case 'g':
-            growable = 1;
+            qemuio_misalign = true;
             break;
         case 'k':
             flags |= BDRV_O_NATIVE_AIO;
@@ -406,7 +418,7 @@ int main(int argc, char **argv)
             }
             break;
         case 'T':
-            if (!trace_backend_init(optarg, NULL)) {
+            if (!trace_init_backends(optarg, NULL)) {
                 exit(1); /* error message will have been printed */
             }
             break;
@@ -427,13 +439,24 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    qemu_init_main_loop();
-    bdrv_init();
+    if (qemu_init_main_loop(&local_error)) {
+        error_report_err(local_error);
+        exit(1);
+    }
 
     /* initialize commands */
     qemuio_add_command(&quit_cmd);
     qemuio_add_command(&open_cmd);
     qemuio_add_command(&close_cmd);
+
+    if (isatty(STDIN_FILENO)) {
+        readline_state = readline_init(readline_printf_func,
+                                       readline_flush_func,
+                                       NULL,
+                                       readline_completion_func);
+        qemu_set_tty_echo(STDIN_FILENO, false);
+        atexit(reenable_tty_echo);
+    }
 
     /* open the device */
     if (!readonly) {
@@ -441,7 +464,7 @@ int main(int argc, char **argv)
     }
 
     if ((argc - optind) == 1) {
-        openfile(argv[optind], flags, growable, NULL);
+        openfile(argv[optind], flags, opts);
     }
     command_loop();
 
@@ -450,8 +473,7 @@ int main(int argc, char **argv)
      */
     bdrv_drain_all();
 
-    if (qemuio_bs) {
-        bdrv_unref(qemuio_bs);
-    }
+    blk_unref(qemuio_blk);
+    g_free(readline_state);
     return 0;
 }

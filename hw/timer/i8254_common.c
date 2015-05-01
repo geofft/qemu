@@ -180,7 +180,6 @@ static const VMStateDescription vmstate_pit_channel = {
     .name = "pit channel",
     .version_id = 2,
     .minimum_version_id = 2,
-    .minimum_version_id_old = 2,
     .fields = (VMStateField[]) {
         VMSTATE_INT32(count, PITChannelState),
         VMSTATE_UINT16(latched_count, PITChannelState),
@@ -282,7 +281,12 @@ static void pit_common_class_init(ObjectClass *klass, void *data)
 
     dc->realize = pit_common_realize;
     dc->vmsd = &vmstate_pit_common;
-    dc->no_user = 1;
+    /*
+     * Reason: unlike ordinary ISA devices, the PIT may need to be
+     * wired to the HPET, and because of that, some wiring is always
+     * done by board code.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo pit_common_type = {

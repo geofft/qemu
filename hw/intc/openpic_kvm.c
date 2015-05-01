@@ -31,6 +31,8 @@
 #include "sysemu/kvm.h"
 #include "qemu/log.h"
 
+#define GCR_RESET        0x80000000
+
 #define KVM_OPENPIC(obj) \
     OBJECT_CHECK(KVMOpenPICState, (obj), TYPE_KVM_OPENPIC)
 
@@ -43,16 +45,12 @@ typedef struct KVMOpenPICState {
     MemoryListener mem_listener;
     uint32_t fd;
     uint32_t model;
+    hwaddr mapped;
 } KVMOpenPICState;
 
 static void kvm_openpic_set_irq(void *opaque, int n_IRQ, int level)
 {
     kvm_set_irq(kvm_state, n_IRQ, level);
-}
-
-static void kvm_openpic_reset(DeviceState *d)
-{
-    qemu_log_mask(LOG_UNIMP, "%s: unimplemented\n", __func__);
 }
 
 static void kvm_openpic_write(void *opaque, hwaddr addr, uint64_t val,
@@ -72,6 +70,14 @@ static void kvm_openpic_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_log_mask(LOG_UNIMP, "%s: %s %" PRIx64 "\n", __func__,
                       strerror(errno), attr.attr);
     }
+}
+
+static void kvm_openpic_reset(DeviceState *d)
+{
+    KVMOpenPICState *opp = KVM_OPENPIC(d);
+
+    /* Trigger the GCR.RESET bit to reset the PIC */
+    kvm_openpic_write(opp, 0x1020, GCR_RESET, sizeof(uint32_t));
 }
 
 static uint64_t kvm_openpic_read(void *opaque, hwaddr addr, unsigned size)
@@ -118,7 +124,21 @@ static void kvm_openpic_region_add(MemoryListener *listener,
         abort();
     }
 
+    /* Ignore events on regions that are not us */
+    if (section->mr != &opp->mem) {
+        return;
+    }
+
+    if (opp->mapped) {
+        /*
+         * We can only map the MPIC once. Since we are already mapped,
+         * the best we can do is ignore new maps.
+         */
+        return;
+    }
+
     reg_base = section->offset_within_address_space;
+    opp->mapped = reg_base;
 
     attr.group = KVM_DEV_MPIC_GRP_MISC;
     attr.attr = KVM_DEV_MPIC_BASE_ADDR;
@@ -139,6 +159,20 @@ static void kvm_openpic_region_del(MemoryListener *listener,
     struct kvm_device_attr attr;
     uint64_t reg_base = 0;
     int ret;
+
+    /* Ignore events on regions that are not us */
+    if (section->mr != &opp->mem) {
+        return;
+    }
+
+    if (section->offset_within_address_space != opp->mapped) {
+        /*
+         * We can only map the MPIC once. This mapping was a secondary
+         * one that we couldn't fulfill. Ignore it.
+         */
+        return;
+    }
+    opp->mapped = 0;
 
     attr.group = KVM_DEV_MPIC_GRP_MISC;
     attr.attr = KVM_DEV_MPIC_BASE_ADDR;
@@ -200,7 +234,7 @@ static void kvm_openpic_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in(dev, kvm_openpic_set_irq, OPENPIC_MAX_IRQ);
 
     opp->mem_listener.region_add = kvm_openpic_region_add;
-    opp->mem_listener.region_add = kvm_openpic_region_del;
+    opp->mem_listener.region_del = kvm_openpic_region_del;
     memory_listener_register(&opp->mem_listener, &address_space_memory);
 
     /* indicate pic capabilities */
@@ -214,7 +248,6 @@ static void kvm_openpic_realize(DeviceState *dev, Error **errp)
         kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
     }
 
-    kvm_irqfds_allowed = true;
     kvm_msi_via_irqfd_allowed = true;
     kvm_gsi_routing_allowed = true;
 
@@ -224,13 +257,9 @@ static void kvm_openpic_realize(DeviceState *dev, Error **errp)
 int kvm_openpic_connect_vcpu(DeviceState *d, CPUState *cs)
 {
     KVMOpenPICState *opp = KVM_OPENPIC(d);
-    struct kvm_enable_cap encap = {};
 
-    encap.cap = KVM_CAP_IRQ_MPIC;
-    encap.args[0] = opp->fd;
-    encap.args[1] = cs->cpu_index;
-
-    return kvm_vcpu_ioctl(cs, KVM_ENABLE_CAP, &encap);
+    return kvm_vcpu_enable_cap(cs, KVM_CAP_IRQ_MPIC, 0, opp->fd,
+                               kvm_arch_vcpu_id(cs));
 }
 
 static Property kvm_openpic_properties[] = {

@@ -246,7 +246,7 @@ static void spapr_powerdown_req(Notifier *n, void *opaque)
     maina->hdr.section_id = cpu_to_be16(RTAS_LOG_V6_SECTION_ID_MAINA);
     maina->hdr.section_length = cpu_to_be16(sizeof(*maina));
     /* FIXME: section version, subtype and creator id? */
-    qemu_get_timedate(&tm, spapr->rtc_offset);
+    spapr_rtc_read(spapr->rtc, &tm, NULL);
     year = tm.tm_year + 1900;
     maina->creation_date = cpu_to_be32((to_bcd(year / 100) << 24)
                                        | (to_bcd(year % 100) << 16)
@@ -314,8 +314,9 @@ static void check_exception(PowerPCCPU *cpu, sPAPREnvironment *spapr,
 
 void spapr_events_init(sPAPREnvironment *spapr)
 {
-    spapr->epow_irq = spapr_allocate_msi(0);
+    spapr->epow_irq = xics_alloc(spapr->icp, 0, 0, false);
     spapr->epow_notifier.notify = spapr_powerdown_req;
     qemu_register_powerdown_notifier(&spapr->epow_notifier);
-    spapr_rtas_register("check-exception", check_exception);
+    spapr_rtas_register(RTAS_CHECK_EXCEPTION, "check-exception",
+                        check_exception);
 }

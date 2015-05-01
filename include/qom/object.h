@@ -273,7 +273,7 @@ typedef struct InterfaceInfo InterfaceInfo;
  *     .name = TYPE_DERIVED,
  *     .parent = TYPE_MY,
  *     .class_size = sizeof(DerivedClass),
- *     .class_init = my_class_init,
+ *     .class_init = derived_class_init,
  * };
  *   </programlisting>
  * </example>
@@ -304,6 +304,25 @@ typedef void (ObjectPropertyAccessor)(Object *obj,
                                       Error **errp);
 
 /**
+ * ObjectPropertyResolve:
+ * @obj: the object that owns the property
+ * @opaque: the opaque registered with the property
+ * @part: the name of the property
+ *
+ * Resolves the #Object corresponding to property @part.
+ *
+ * The returned object can also be used as a starting point
+ * to resolve a relative path starting with "@part".
+ *
+ * Returns: If @path is the path that led to @obj, the function
+ * returns the #Object corresponding to "@path/@part".
+ * If "@path/@part" is not a valid object path, it returns #NULL.
+ */
+typedef Object *(ObjectPropertyResolve)(Object *obj,
+                                        void *opaque,
+                                        const char *part);
+
+/**
  * ObjectPropertyRelease:
  * @obj: the object that owns the property
  * @name: the name of the property
@@ -319,8 +338,10 @@ typedef struct ObjectProperty
 {
     gchar *name;
     gchar *type;
+    gchar *description;
     ObjectPropertyAccessor *get;
     ObjectPropertyAccessor *set;
+    ObjectPropertyResolve *resolve;
     ObjectPropertyRelease *release;
     void *opaque;
 
@@ -358,7 +379,8 @@ struct ObjectClass
     Type type;
     GSList *interfaces;
 
-    const char *cast_cache[OBJECT_CLASS_CAST_CACHE];
+    const char *object_cast_cache[OBJECT_CLASS_CAST_CACHE];
+    const char *class_cast_cache[OBJECT_CLASS_CAST_CACHE];
 
     ObjectUnparent *unparent;
 };
@@ -535,6 +557,7 @@ struct InterfaceClass
     ObjectClass parent_class;
     /*< private >*/
     ObjectClass *concrete_class;
+    Type interface_type;
 };
 
 #define TYPE_INTERFACE "interface"
@@ -785,12 +808,16 @@ void object_unref(Object *obj);
  *   destruction.  This may be NULL.
  * @opaque: an opaque pointer to pass to the callbacks for the property
  * @errp: returns an error if this function fails
+ *
+ * Returns: The #ObjectProperty; this can be used to set the @resolve
+ * callback for child and link properties.
  */
-void object_property_add(Object *obj, const char *name, const char *type,
-                         ObjectPropertyAccessor *get,
-                         ObjectPropertyAccessor *set,
-                         ObjectPropertyRelease *release,
-                         void *opaque, Error **errp);
+ObjectProperty *object_property_add(Object *obj, const char *name,
+                                    const char *type,
+                                    ObjectPropertyAccessor *get,
+                                    ObjectPropertyAccessor *set,
+                                    ObjectPropertyRelease *release,
+                                    void *opaque, Error **errp);
 
 void object_property_del(Object *obj, const char *name, Error **errp);
 
@@ -915,6 +942,34 @@ int64_t object_property_get_int(Object *obj, const char *name,
                                 Error **errp);
 
 /**
+ * object_property_get_enum:
+ * @obj: the object
+ * @name: the name of the property
+ * @strings: strings corresponding to enums
+ * @errp: returns an error if this function fails
+ *
+ * Returns: the value of the property, converted to an integer, or
+ * undefined if an error occurs (including when the property value is not
+ * an enum).
+ */
+int object_property_get_enum(Object *obj, const char *name,
+                             const char *strings[], Error **errp);
+
+/**
+ * object_property_get_uint16List:
+ * @obj: the object
+ * @name: the name of the property
+ * @list: the returned int list
+ * @errp: returns an error if this function fails
+ *
+ * Returns: the value of the property, converted to integers, or
+ * undefined if an error occurs (including when the property value is not
+ * an list of integers).
+ */
+void object_property_get_uint16List(Object *obj, const char *name,
+                                    uint16List **list, Error **errp);
+
+/**
  * object_property_set:
  * @obj: the object
  * @v: the visitor that will be used to write the property value.  This should
@@ -944,12 +999,13 @@ void object_property_parse(Object *obj, const char *string,
  * object_property_print:
  * @obj: the object
  * @name: the name of the property
+ * @human: if true, print for human consumption
  * @errp: returns an error if this function fails
  *
  * Returns a string representation of the value of the property.  The
  * caller shall free the string.
  */
-char *object_property_print(Object *obj, const char *name,
+char *object_property_print(Object *obj, const char *name, bool human,
                             Error **errp);
 
 /**
@@ -969,6 +1025,14 @@ const char *object_property_get_type(Object *obj, const char *name,
  * Returns: the root object of the composition tree
  */
 Object *object_get_root(void);
+
+/**
+ * object_get_canonical_path_component:
+ *
+ * Returns: The final component in the object's canonical path.  The canonical
+ * path is the path within the composition tree starting from the root.
+ */
+gchar *object_get_canonical_path_component(Object *obj);
 
 /**
  * object_get_canonical_path:
@@ -1056,12 +1120,29 @@ Object *object_resolve_path_component(Object *parent, const gchar *part);
 void object_property_add_child(Object *obj, const char *name,
                                Object *child, Error **errp);
 
+typedef enum {
+    /* Unref the link pointer when the property is deleted */
+    OBJ_PROP_LINK_UNREF_ON_RELEASE = 0x1,
+} ObjectPropertyLinkFlags;
+
+/**
+ * object_property_allow_set_link:
+ *
+ * The default implementation of the object_property_add_link() check()
+ * callback function.  It allows the link property to be set and never returns
+ * an error.
+ */
+void object_property_allow_set_link(Object *, const char *,
+                                    Object *, Error **);
+
 /**
  * object_property_add_link:
  * @obj: the object to add a property to
  * @name: the name of the property
  * @type: the qobj type of the link
  * @child: a pointer to where the link object reference is stored
+ * @check: callback to veto setting or NULL if the property is read-only
+ * @flags: additional options for the link
  * @errp: if an error occurs, a pointer to an area to store the area
  *
  * Links establish relationships between objects.  Links are unidirectional
@@ -1070,13 +1151,23 @@ void object_property_add_child(Object *obj, const char *name,
  *
  * Links form the graph in the object model.
  *
+ * The <code>@check()</code> callback is invoked when
+ * object_property_set_link() is called and can raise an error to prevent the
+ * link being set.  If <code>@check</code> is NULL, the property is read-only
+ * and cannot be set.
+ *
  * Ownership of the pointer that @child points to is transferred to the
  * link property.  The reference count for <code>*@child</code> is
  * managed by the property from after the function returns till the
- * property is deleted with object_property_del().
+ * property is deleted with object_property_del().  If the
+ * <code>@flags</code> <code>OBJ_PROP_LINK_UNREF_ON_RELEASE</code> bit is set,
+ * the reference count is decremented when the property is deleted.
  */
 void object_property_add_link(Object *obj, const char *name,
                               const char *type, Object **child,
+                              void (*check)(Object *obj, const char *name,
+                                            Object *val, Error **errp),
+                              ObjectPropertyLinkFlags flags,
                               Error **errp);
 
 /**
@@ -1111,6 +1202,20 @@ void object_property_add_bool(Object *obj, const char *name,
                               bool (*get)(Object *, Error **),
                               void (*set)(Object *, bool, Error **),
                               Error **errp);
+
+/**
+ * object_property_add_tm:
+ * @obj: the object to add a property to
+ * @name: the name of the property
+ * @get: the getter or NULL if the property is write-only.
+ * @errp: if an error occurs, a pointer to an area to store the error
+ *
+ * Add a read-only struct tm valued property using a getter function.
+ * This function will add a property of type 'struct tm'.
+ */
+void object_property_add_tm(Object *obj, const char *name,
+                            void (*get)(Object *, struct tm *, Error **),
+                            Error **errp);
 
 /**
  * object_property_add_uint8_ptr:
@@ -1163,6 +1268,39 @@ void object_property_add_uint32_ptr(Object *obj, const char *name,
  */
 void object_property_add_uint64_ptr(Object *obj, const char *name,
                                     const uint64_t *v, Error **Errp);
+
+/**
+ * object_property_add_alias:
+ * @obj: the object to add a property to
+ * @name: the name of the property
+ * @target_obj: the object to forward property access to
+ * @target_name: the name of the property on the forwarded object
+ * @errp: if an error occurs, a pointer to an area to store the error
+ *
+ * Add an alias for a property on an object.  This function will add a property
+ * of the same type as the forwarded property.
+ *
+ * The caller must ensure that <code>@target_obj</code> stays alive as long as
+ * this property exists.  In the case of a child object or an alias on the same
+ * object this will be the case.  For aliases to other objects the caller is
+ * responsible for taking a reference.
+ */
+void object_property_add_alias(Object *obj, const char *name,
+                               Object *target_obj, const char *target_name,
+                               Error **errp);
+
+/**
+ * object_property_set_description:
+ * @obj: the object owning the property
+ * @name: the name of the property
+ * @description: the description of the property on the object
+ * @errp: if an error occurs, a pointer to an area to store the error
+ *
+ * Set an object property's description.
+ *
+ */
+void object_property_set_description(Object *obj, const char *name,
+                                     const char *description, Error **errp);
 
 /**
  * object_child_foreach:

@@ -24,18 +24,10 @@
 
 /* icc-bridge implementation */
 
-static void icc_bus_init(Object *obj)
-{
-    BusState *b = BUS(obj);
-
-    b->allow_hotplug = true;
-}
-
 static const TypeInfo icc_bus_info = {
     .name = TYPE_ICC_BUS,
     .parent = TYPE_BUS,
     .instance_size = sizeof(ICCBus),
-    .instance_init = icc_bus_init,
 };
 
 
@@ -43,15 +35,13 @@ static const TypeInfo icc_bus_info = {
 
 static void icc_device_realize(DeviceState *dev, Error **errp)
 {
-    ICCDevice *id = ICC_DEVICE(dev);
-    ICCDeviceClass *idc = ICC_DEVICE_GET_CLASS(id);
+    ICCDeviceClass *idc = ICC_DEVICE_GET_CLASS(dev);
 
-    if (idc->init) {
-        if (idc->init(id) < 0) {
-            error_setg(errp, "%s initialization failed.",
-                       object_get_typename(OBJECT(dev)));
-        }
+    /* convert to QOM */
+    if (idc->realize) {
+        idc->realize(dev, errp);
     }
+
 }
 
 static void icc_device_class_init(ObjectClass *oc, void *data)
@@ -83,11 +73,11 @@ typedef struct ICCBridgeState {
     MemoryRegion apic_container;
 } ICCBridgeState;
 
-#define ICC_BRIGDE(obj) OBJECT_CHECK(ICCBridgeState, (obj), TYPE_ICC_BRIDGE)
+#define ICC_BRIDGE(obj) OBJECT_CHECK(ICCBridgeState, (obj), TYPE_ICC_BRIDGE)
 
 static void icc_bridge_init(Object *obj)
 {
-    ICCBridgeState *s = ICC_BRIGDE(obj);
+    ICCBridgeState *s = ICC_BRIDGE(obj);
     SysBusDevice *sb = SYS_BUS_DEVICE(obj);
 
     qbus_create_inplace(&s->icc_bus, sizeof(s->icc_bus), TYPE_ICC_BUS,

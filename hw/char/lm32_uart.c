@@ -177,7 +177,7 @@ static void uart_write(void *opaque, hwaddr addr,
     switch (addr) {
     case R_RXTX:
         if (s->chr) {
-            qemu_chr_fe_write(s->chr, &ch, 1);
+            qemu_chr_fe_write_all(s->chr, &ch, 1);
         }
         break;
     case R_IER:
@@ -258,6 +258,7 @@ static int lm32_uart_init(SysBusDevice *dev)
                           "uart", R_MAX * 4);
     sysbus_init_mmio(dev, &s->iomem);
 
+    /* FIXME use a qdev chardev prop instead of qemu_char_get_next_serial() */
     s->chr = qemu_char_get_next_serial();
     if (s->chr) {
         qemu_chr_add_handlers(s->chr, uart_can_rx, uart_rx, uart_event, s);
@@ -270,8 +271,7 @@ static const VMStateDescription vmstate_lm32_uart = {
     .name = "lm32-uart",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, LM32UartState, R_MAX),
         VMSTATE_END_OF_LIST()
     }
@@ -285,6 +285,8 @@ static void lm32_uart_class_init(ObjectClass *klass, void *data)
     k->init = lm32_uart_init;
     dc->reset = uart_reset;
     dc->vmsd = &vmstate_lm32_uart;
+    /* Reason: init() method uses qemu_char_get_next_serial() */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo lm32_uart_info = {

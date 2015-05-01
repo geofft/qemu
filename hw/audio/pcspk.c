@@ -167,7 +167,7 @@ static void pcspk_initfn(Object *obj)
 {
     PCSpkState *s = PC_SPEAKER(obj);
 
-    memory_region_init_io(&s->ioport, OBJECT(s), &pcspk_io_ops, s, "elcr", 1);
+    memory_region_init_io(&s->ioport, OBJECT(s), &pcspk_io_ops, s, "pcspk", 1);
 }
 
 static void pcspk_realizefn(DeviceState *dev, Error **errp)
@@ -181,7 +181,7 @@ static void pcspk_realizefn(DeviceState *dev, Error **errp)
 }
 
 static Property pcspk_properties[] = {
-    DEFINE_PROP_HEX32("iobase", PCSpkState, iobase,  -1),
+    DEFINE_PROP_UINT32("iobase", PCSpkState, iobase,  -1),
     DEFINE_PROP_PTR("pit", PCSpkState, pit),
     DEFINE_PROP_END_OF_LIST(),
 };
@@ -192,8 +192,9 @@ static void pcspk_class_initfn(ObjectClass *klass, void *data)
 
     dc->realize = pcspk_realizefn;
     set_bit(DEVICE_CATEGORY_SOUND, dc->categories);
-    dc->no_user = 1;
     dc->props = pcspk_properties;
+    /* Reason: pointer property "pit", realize sets global pcspk_state */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo pcspk_info = {

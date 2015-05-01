@@ -16,8 +16,9 @@
 #include "sysemu/sysemu.h"
 #include "hw/boards.h"
 #include "hw/i2c/i2c.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
+#include "qemu/error-report.h"
 
 #define SMP_BOOT_ADDR 0xe0000000
 #define SMP_BOOTREG_ADDR 0x10000030
@@ -44,13 +45,14 @@ static const int realview_board_id[] = {
     0x76d
 };
 
-static void realview_init(QEMUMachineInitArgs *args,
+static void realview_init(MachineState *machine,
                           enum realview_board_type board_type)
 {
     ARMCPU *cpu = NULL;
     CPUARMState *env;
+    ObjectClass *cpu_oc;
     MemoryRegion *sysmem = get_system_memory();
-    MemoryRegion *ram_lo = g_new(MemoryRegion, 1);
+    MemoryRegion *ram_lo;
     MemoryRegion *ram_hi = g_new(MemoryRegion, 1);
     MemoryRegion *ram_alias = g_new(MemoryRegion, 1);
     MemoryRegion *ram_hack = g_new(MemoryRegion, 1);
@@ -60,7 +62,7 @@ static void realview_init(QEMUMachineInitArgs *args,
     qemu_irq mmc_irq[2];
     PCIBus *pci_bus = NULL;
     NICInfo *nd;
-    i2c_bus *i2c;
+    I2CBus *i2c;
     int n;
     int done_nic = 0;
     qemu_irq cpu_irq[4];
@@ -69,13 +71,15 @@ static void realview_init(QEMUMachineInitArgs *args,
     uint32_t proc_id = 0;
     uint32_t sys_id;
     ram_addr_t low_ram_size;
-    ram_addr_t ram_size = args->ram_size;
+    ram_addr_t ram_size = machine->ram_size;
+    hwaddr periphbase = 0;
 
     switch (board_type) {
     case BOARD_EB:
         break;
     case BOARD_EB_MPCORE:
         is_mpcore = 1;
+        periphbase = 0x10100000;
         break;
     case BOARD_PB_A8:
         is_pb = 1;
@@ -83,16 +87,49 @@ static void realview_init(QEMUMachineInitArgs *args,
     case BOARD_PBX_A9:
         is_mpcore = 1;
         is_pb = 1;
+        periphbase = 0x1f000000;
         break;
     }
+
+    cpu_oc = cpu_class_by_name(TYPE_ARM_CPU, machine->cpu_model);
+    if (!cpu_oc) {
+        fprintf(stderr, "Unable to find CPU definition\n");
+        exit(1);
+    }
+
     for (n = 0; n < smp_cpus; n++) {
-        cpu = cpu_arm_init(args->cpu_model);
-        if (!cpu) {
-            fprintf(stderr, "Unable to find CPU definition\n");
+        Object *cpuobj = object_new(object_class_get_name(cpu_oc));
+        Error *err = NULL;
+
+        /* By default A9,A15 and ARM1176 CPUs have EL3 enabled.  This board
+         * does not currently support EL3 so the CPU EL3 property is disabled
+         * before realization.
+         */
+        if (object_property_find(cpuobj, "has_el3", NULL)) {
+            object_property_set_bool(cpuobj, false, "has_el3", &err);
+            if (err) {
+                error_report_err(err);
+                exit(1);
+            }
+        }
+
+        if (is_pb && is_mpcore) {
+            object_property_set_int(cpuobj, periphbase, "reset-cbar", &err);
+            if (err) {
+                error_report_err(err);
+                exit(1);
+            }
+        }
+
+        object_property_set_bool(cpuobj, true, "realized", &err);
+        if (err) {
+            error_report_err(err);
             exit(1);
         }
-        cpu_irq[n] = qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ);
+
+        cpu_irq[n] = qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ);
     }
+    cpu = ARM_CPU(first_cpu);
     env = &cpu->env;
     if (arm_feature(env, ARM_FEATURE_V7)) {
         if (is_mpcore) {
@@ -110,14 +147,17 @@ static void realview_init(QEMUMachineInitArgs *args,
 
     if (is_pb && ram_size > 0x20000000) {
         /* Core tile RAM.  */
+        ram_lo = g_new(MemoryRegion, 1);
         low_ram_size = ram_size - 0x20000000;
         ram_size = 0x20000000;
-        memory_region_init_ram(ram_lo, NULL, "realview.lowmem", low_ram_size);
+        memory_region_init_ram(ram_lo, NULL, "realview.lowmem", low_ram_size,
+                               &error_abort);
         vmstate_register_ram_global(ram_lo);
         memory_region_add_subregion(sysmem, 0x20000000, ram_lo);
     }
 
-    memory_region_init_ram(ram_hi, NULL, "realview.highmem", ram_size);
+    memory_region_init_ram(ram_hi, NULL, "realview.highmem", ram_size,
+                           &error_abort);
     vmstate_register_ram_global(ram_hi);
     low_ram_size = ram_size;
     if (low_ram_size > 0x10000000)
@@ -141,16 +181,10 @@ static void realview_init(QEMUMachineInitArgs *args,
     sysbus_mmio_map(SYS_BUS_DEVICE(sysctl), 0, 0x10000000);
 
     if (is_mpcore) {
-        hwaddr periphbase;
         dev = qdev_create(NULL, is_pb ? "a9mpcore_priv": "realview_mpcore");
         qdev_prop_set_uint32(dev, "num-cpu", smp_cpus);
         qdev_init_nofail(dev);
         busdev = SYS_BUS_DEVICE(dev);
-        if (is_pb) {
-            periphbase = 0x1f000000;
-        } else {
-            periphbase = 0x10100000;
-        }
         sysbus_mmio_map(busdev, 0, periphbase);
         for (n = 0; n < smp_cpus; n++) {
             sysbus_connect_irq(busdev, n, cpu_irq[n]);
@@ -227,7 +261,7 @@ static void realview_init(QEMUMachineInitArgs *args,
         sysbus_connect_irq(busdev, 2, pic[50]);
         sysbus_connect_irq(busdev, 3, pic[51]);
         pci_bus = (PCIBus *)qdev_get_child_bus(dev, "pci");
-        if (usb_enabled(false)) {
+        if (usb_enabled()) {
             pci_create_simple(pci_bus, -1, "pci-ohci");
         }
         n = drive_get_max_bus(IF_SCSI);
@@ -255,7 +289,7 @@ static void realview_init(QEMUMachineInitArgs *args,
     }
 
     dev = sysbus_create_simple("versatile_i2c", 0x10002000, NULL);
-    i2c = (i2c_bus *)qdev_get_child_bus(dev, "i2c");
+    i2c = (I2CBus *)qdev_get_child_bus(dev, "i2c");
     i2c_create_slave(i2c, "ds1338", 0x68);
 
     /* Memory map for RealView Emulation Baseboard:  */
@@ -318,50 +352,51 @@ static void realview_init(QEMUMachineInitArgs *args,
        startup code.  I guess this works on real hardware because the
        BootROM happens to be in ROM/flash or in memory that isn't clobbered
        until after Linux boots the secondary CPUs.  */
-    memory_region_init_ram(ram_hack, NULL, "realview.hack", 0x1000);
+    memory_region_init_ram(ram_hack, NULL, "realview.hack", 0x1000,
+                           &error_abort);
     vmstate_register_ram_global(ram_hack);
     memory_region_add_subregion(sysmem, SMP_BOOT_ADDR, ram_hack);
 
     realview_binfo.ram_size = ram_size;
-    realview_binfo.kernel_filename = args->kernel_filename;
-    realview_binfo.kernel_cmdline = args->kernel_cmdline;
-    realview_binfo.initrd_filename = args->initrd_filename;
+    realview_binfo.kernel_filename = machine->kernel_filename;
+    realview_binfo.kernel_cmdline = machine->kernel_cmdline;
+    realview_binfo.initrd_filename = machine->initrd_filename;
     realview_binfo.nb_cpus = smp_cpus;
     realview_binfo.board_id = realview_board_id[board_type];
     realview_binfo.loader_start = (board_type == BOARD_PB_A8 ? 0x70000000 : 0);
     arm_load_kernel(ARM_CPU(first_cpu), &realview_binfo);
 }
 
-static void realview_eb_init(QEMUMachineInitArgs *args)
+static void realview_eb_init(MachineState *machine)
 {
-    if (!args->cpu_model) {
-        args->cpu_model = "arm926";
+    if (!machine->cpu_model) {
+        machine->cpu_model = "arm926";
     }
-    realview_init(args, BOARD_EB);
+    realview_init(machine, BOARD_EB);
 }
 
-static void realview_eb_mpcore_init(QEMUMachineInitArgs *args)
+static void realview_eb_mpcore_init(MachineState *machine)
 {
-    if (!args->cpu_model) {
-        args->cpu_model = "arm11mpcore";
+    if (!machine->cpu_model) {
+        machine->cpu_model = "arm11mpcore";
     }
-    realview_init(args, BOARD_EB_MPCORE);
+    realview_init(machine, BOARD_EB_MPCORE);
 }
 
-static void realview_pb_a8_init(QEMUMachineInitArgs *args)
+static void realview_pb_a8_init(MachineState *machine)
 {
-    if (!args->cpu_model) {
-        args->cpu_model = "cortex-a8";
+    if (!machine->cpu_model) {
+        machine->cpu_model = "cortex-a8";
     }
-    realview_init(args, BOARD_PB_A8);
+    realview_init(machine, BOARD_PB_A8);
 }
 
-static void realview_pbx_a9_init(QEMUMachineInitArgs *args)
+static void realview_pbx_a9_init(MachineState *machine)
 {
-    if (!args->cpu_model) {
-        args->cpu_model = "cortex-a9";
+    if (!machine->cpu_model) {
+        machine->cpu_model = "cortex-a9";
     }
-    realview_init(args, BOARD_PBX_A9);
+    realview_init(machine, BOARD_PBX_A9);
 }
 
 static QEMUMachine realview_eb_machine = {

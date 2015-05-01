@@ -230,7 +230,7 @@ PCIBus *pci_pmac_init(qemu_irq *pic,
     d = UNI_NORTH_PCI_HOST_BRIDGE(dev);
     memory_region_init(&d->pci_mmio, OBJECT(d), "pci-mmio", 0x100000000ULL);
     memory_region_init_alias(&d->pci_hole, OBJECT(d), "pci-hole", &d->pci_mmio,
-                             0x80000000ULL, 0x70000000ULL);
+                             0x80000000ULL, 0x10000000ULL);
     memory_region_add_subregion(address_space_mem, 0x80000000ULL,
                                 &d->pci_hole);
 
@@ -315,48 +315,50 @@ PCIBus *pci_pmac_u3_init(qemu_irq *pic,
     return h->bus;
 }
 
-static int unin_main_pci_host_init(PCIDevice *d)
+static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[0x0C] = 0x08; // cache_line_size
     d->config[0x0D] = 0x10; // latency_timer
     d->config[0x34] = 0x00; // capabilities_pointer
-    return 0;
 }
 
-static int unin_agp_pci_host_init(PCIDevice *d)
+static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[0x0C] = 0x08; // cache_line_size
     d->config[0x0D] = 0x10; // latency_timer
     //    d->config[0x34] = 0x80; // capabilities_pointer
-    return 0;
 }
 
-static int u3_agp_pci_host_init(PCIDevice *d)
+static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     /* cache line size */
     d->config[0x0C] = 0x08;
     /* latency timer */
     d->config[0x0D] = 0x10;
-    return 0;
 }
 
-static int unin_internal_pci_host_init(PCIDevice *d)
+static void unin_internal_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[0x0C] = 0x08; // cache_line_size
     d->config[0x0D] = 0x10; // latency_timer
     d->config[0x34] = 0x00; // capabilities_pointer
-    return 0;
 }
 
 static void unin_main_pci_host_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init      = unin_main_pci_host_init;
+    k->realize   = unin_main_pci_host_realize;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_PCI;
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo unin_main_pci_host_info = {
@@ -369,12 +371,18 @@ static const TypeInfo unin_main_pci_host_info = {
 static void u3_agp_pci_host_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init      = u3_agp_pci_host_init;
+    k->realize   = u3_agp_pci_host_realize;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_U3_AGP;
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo u3_agp_pci_host_info = {
@@ -387,12 +395,18 @@ static const TypeInfo u3_agp_pci_host_info = {
 static void unin_agp_pci_host_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init      = unin_agp_pci_host_init;
+    k->realize   = unin_agp_pci_host_realize;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_AGP;
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo unin_agp_pci_host_info = {
@@ -405,12 +419,18 @@ static const TypeInfo unin_agp_pci_host_info = {
 static void unin_internal_pci_host_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->init      = unin_internal_pci_host_init;
+    k->realize   = unin_internal_pci_host_realize;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_I_PCI;
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo unin_internal_pci_host_info = {

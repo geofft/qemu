@@ -215,36 +215,6 @@ typedef struct {
     int fsref;
 } TSC210xRateInfo;
 
-/*  { rate,  dsor,  fsref } */
-static const TSC210xRateInfo tsc2101_rates[] = {
-    /* Fsref / 6.0 */
-    { 7350,	7,	1 },
-    { 8000,	7,	0 },
-    /* Fsref / 5.5 */
-    { 8018,	6,	1 },
-    { 8727,	6,	0 },
-    /* Fsref / 5.0 */
-    { 8820,	5,	1 },
-    { 9600,	5,	0 },
-    /* Fsref / 4.0 */
-    { 11025,	4,	1 },
-    { 12000,	4,	0 },
-    /* Fsref / 3.0 */
-    { 14700,	3,	1 },
-    { 16000,	3,	0 },
-    /* Fsref / 2.0 */
-    { 22050,	2,	1 },
-    { 24000,	2,	0 },
-    /* Fsref / 1.5 */
-    { 29400,	1,	1 },
-    { 32000,	1,	0 },
-    /* Fsref */
-    { 44100,	0,	1 },
-    { 48000,	0,	0 },
-
-    { 0,	0, 	0 },
-};
-
 /*  { rate,   dsor, fsref }	*/
 static const TSC210xRateInfo tsc2102_rates[] = {
     /* Fsref / 6.0 */
@@ -1070,9 +1040,21 @@ static int tsc210x_load(QEMUFile *f, void *opaque, int version_id)
     s->enabled = qemu_get_byte(f);
     s->host_mode = qemu_get_byte(f);
     s->function = qemu_get_byte(f);
+    if (s->function < 0 || s->function >= ARRAY_SIZE(mode_regs)) {
+        return -EINVAL;
+    }
     s->nextfunction = qemu_get_byte(f);
+    if (s->nextfunction < 0 || s->nextfunction >= ARRAY_SIZE(mode_regs)) {
+        return -EINVAL;
+    }
     s->precision = qemu_get_byte(f);
+    if (s->precision < 0 || s->precision >= ARRAY_SIZE(resolution)) {
+        return -EINVAL;
+    }
     s->nextprecision = qemu_get_byte(f);
+    if (s->nextprecision < 0 || s->nextprecision >= ARRAY_SIZE(resolution)) {
+        return -EINVAL;
+    }
     s->filter = qemu_get_byte(f);
     s->pin_func = qemu_get_byte(f);
     s->ref = qemu_get_byte(f);

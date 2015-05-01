@@ -29,6 +29,7 @@
 #include "hw/qdev.h"
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
+#include "sysemu/sysemu.h"
 
 #include <libfdt.h>
 
@@ -71,7 +72,14 @@ typedef uint64_t vlan_bd_t;
 #define VLAN_RXQ_BD_OFF      0
 #define VLAN_FILTER_BD_OFF   8
 #define VLAN_RX_BDS_OFF      16
-#define VLAN_MAX_BUFS        ((SPAPR_TCE_PAGE_SIZE - VLAN_RX_BDS_OFF) / 8)
+/*
+ * The final 8 bytes of the buffer list is a counter of frames dropped
+ * because there was not a buffer in the buffer list capable of holding
+ * the frame. We must avoid it, or the operating system will report garbage
+ * for this statistic.
+ */
+#define VLAN_RX_BDS_LEN      (SPAPR_TCE_PAGE_SIZE - VLAN_RX_BDS_OFF - 8)
+#define VLAN_MAX_BUFS        (VLAN_RX_BDS_LEN / 8)
 
 #define TYPE_VIO_SPAPR_VLAN_DEVICE "spapr-vlan"
 #define VIO_SPAPR_VLAN_DEVICE(obj) \
@@ -118,7 +126,7 @@ static ssize_t spapr_vlan_receive(NetClientState *nc, const uint8_t *buf,
 
     do {
         buf_ptr += 8;
-        if (buf_ptr >= SPAPR_TCE_PAGE_SIZE) {
+        if (buf_ptr >= (VLAN_RX_BDS_LEN + VLAN_RX_BDS_OFF)) {
             buf_ptr = VLAN_RX_BDS_OFF;
         }
 
@@ -179,19 +187,11 @@ static ssize_t spapr_vlan_receive(NetClientState *nc, const uint8_t *buf,
     return size;
 }
 
-static void spapr_vlan_cleanup(NetClientState *nc)
-{
-    VIOsPAPRVLANDevice *dev = qemu_get_nic_opaque(nc);
-
-    dev->nic = NULL;
-}
-
 static NetClientInfo net_spapr_vlan_info = {
     .type = NET_CLIENT_OPTIONS_KIND_NIC,
     .size = sizeof(NICState),
     .can_receive = spapr_vlan_can_receive,
     .receive = spapr_vlan_receive,
-    .cleanup = spapr_vlan_cleanup,
 };
 
 static void spapr_vlan_reset(VIOsPAPRDevice *sdev)
@@ -203,7 +203,7 @@ static void spapr_vlan_reset(VIOsPAPRDevice *sdev)
     dev->isopen = 0;
 }
 
-static int spapr_vlan_init(VIOsPAPRDevice *sdev)
+static void spapr_vlan_realize(VIOsPAPRDevice *sdev, Error **errp)
 {
     VIOsPAPRVLANDevice *dev = VIO_SPAPR_VLAN_DEVICE(sdev);
 
@@ -212,8 +212,15 @@ static int spapr_vlan_init(VIOsPAPRDevice *sdev)
     dev->nic = qemu_new_nic(&net_spapr_vlan_info, &dev->nicconf,
                             object_get_typename(OBJECT(sdev)), sdev->qdev.id, dev);
     qemu_format_nic_info_str(qemu_get_queue(dev->nic), dev->nicconf.macaddr.a);
+}
 
-    return 0;
+static void spapr_vlan_instance_init(Object *obj)
+{
+    VIOsPAPRVLANDevice *dev = VIO_SPAPR_VLAN_DEVICE(obj);
+
+    device_add_bootindex_property(obj, &dev->nicconf.bootindex,
+                                  "bootindex", "",
+                                  DEVICE(dev), NULL);
 }
 
 void spapr_vlan_create(VIOsPAPRBus *bus, NICInfo *nd)
@@ -394,7 +401,7 @@ static target_ulong h_add_logical_lan_buffer(PowerPCCPU *cpu,
 
     do {
         dev->add_buf_ptr += 8;
-        if (dev->add_buf_ptr >= SPAPR_TCE_PAGE_SIZE) {
+        if (dev->add_buf_ptr >= (VLAN_RX_BDS_LEN + VLAN_RX_BDS_OFF)) {
             dev->add_buf_ptr = VLAN_RX_BDS_OFF;
         }
 
@@ -404,6 +411,8 @@ static target_ulong h_add_logical_lan_buffer(PowerPCCPU *cpu,
     vio_stq(sdev, dev->buf_list + dev->add_buf_ptr, buf);
 
     dev->rx_bufs++;
+
+    qemu_flush_queued_packets(qemu_get_queue(dev->nic));
 
     DPRINTF("h_add_logical_lan_buffer():  Added buf  ptr=%d  rx_bufs=%d"
             " bd=0x%016llx\n", dev->add_buf_ptr, dev->rx_bufs,
@@ -504,8 +513,7 @@ static const VMStateDescription vmstate_spapr_llan = {
     .name = "spapr_llan",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields      = (VMStateField []) {
+    .fields = (VMStateField[]) {
         VMSTATE_SPAPR_VIO(sdev, VIOsPAPRVLANDevice),
         /* LLAN state */
         VMSTATE_BOOL(isopen, VIOsPAPRVLANDevice),
@@ -524,7 +532,7 @@ static void spapr_vlan_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     VIOsPAPRDeviceClass *k = VIO_SPAPR_DEVICE_CLASS(klass);
 
-    k->init = spapr_vlan_init;
+    k->realize = spapr_vlan_realize;
     k->reset = spapr_vlan_reset;
     k->devnode = spapr_vlan_devnode;
     k->dt_name = "l-lan";
@@ -542,6 +550,7 @@ static const TypeInfo spapr_vlan_info = {
     .parent        = TYPE_VIO_SPAPR_DEVICE,
     .instance_size = sizeof(VIOsPAPRVLANDevice),
     .class_init    = spapr_vlan_class_init,
+    .instance_init = spapr_vlan_instance_init,
 };
 
 static void spapr_vlan_register_types(void)

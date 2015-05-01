@@ -138,7 +138,7 @@ static void kvm_pit_get(PITCommonState *pit)
 static void kvm_pit_put(PITCommonState *pit)
 {
     KVMPITState *s = KVM_PIT(pit);
-    struct kvm_pit_state2 kpit;
+    struct kvm_pit_state2 kpit = {};
     struct kvm_pit_channel_state *kchan;
     struct PITChannelState *sc;
     int i, ret;
@@ -239,6 +239,7 @@ static void kvm_pit_vm_state_change(void *opaque, int running,
 
     if (running) {
         kvm_pit_update_clock_offset(s);
+        kvm_pit_put(PIT_COMMON(s));
         s->vm_stopped = false;
     } else {
         kvm_pit_update_clock_offset(s);
@@ -268,9 +269,9 @@ static void kvm_pit_realizefn(DeviceState *dev, Error **errp)
         return;
     }
     switch (s->lost_tick_policy) {
-    case LOST_TICK_DELAY:
+    case LOST_TICK_POLICY_DELAY:
         break; /* enabled by default */
-    case LOST_TICK_DISCARD:
+    case LOST_TICK_POLICY_DISCARD:
         if (kvm_check_extension(kvm_state, KVM_CAP_REINJECT_CONTROL)) {
             struct kvm_reinject_control control = { .pit_reinject = 0 };
 
@@ -298,9 +299,9 @@ static void kvm_pit_realizefn(DeviceState *dev, Error **errp)
 }
 
 static Property kvm_pit_properties[] = {
-    DEFINE_PROP_HEX32("iobase", PITCommonState, iobase,  -1),
+    DEFINE_PROP_UINT32("iobase", PITCommonState, iobase,  -1),
     DEFINE_PROP_LOSTTICKPOLICY("lost_tick_policy", KVMPITState,
-                               lost_tick_policy, LOST_TICK_DELAY),
+                               lost_tick_policy, LOST_TICK_POLICY_DELAY),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -314,8 +315,6 @@ static void kvm_pit_class_init(ObjectClass *klass, void *data)
     dc->realize = kvm_pit_realizefn;
     k->set_channel_gate = kvm_pit_set_gate;
     k->get_channel_info = kvm_pit_get_channel_info;
-    k->pre_save = kvm_pit_get;
-    k->post_load = kvm_pit_put;
     dc->reset = kvm_pit_reset;
     dc->props = kvm_pit_properties;
 }

@@ -30,6 +30,7 @@
 #include "hw/sysbus.h"
 #include "qemu/range.h"
 #include "ui/pixel_ops.h"
+#include "exec/address-spaces.h"
 
 /*
  * Status: 2010/05/07
@@ -1409,7 +1410,7 @@ void sm501_init(MemoryRegion *address_space_mem, uint32_t base,
 
     /* allocate local memory */
     memory_region_init_ram(&s->local_mem_region, NULL, "sm501.local",
-                           local_mem_bytes);
+                           local_mem_bytes, &error_abort);
     vmstate_register_ram_global(&s->local_mem_region);
     s->local_mem = memory_region_get_ram_ptr(&s->local_mem_region);
     memory_region_add_subregion(address_space_mem, base, &s->local_mem_region);
@@ -1448,5 +1449,5 @@ void sm501_init(MemoryRegion *address_space_mem, uint32_t base,
     }
 
     /* create qemu graphic console */
-    s->con = graphic_console_init(DEVICE(dev), &sm501_ops, s);
+    s->con = graphic_console_init(DEVICE(dev), 0, &sm501_ops, s);
 }

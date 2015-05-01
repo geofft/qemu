@@ -123,7 +123,7 @@ int pcie_aer_init(PCIDevice *dev, uint16_t offset)
                  PCI_ERR_UNC_SUPPORTED);
 
     pci_long_test_and_set_mask(dev->w1cmask + offset + PCI_ERR_COR_STATUS,
-                               PCI_ERR_COR_STATUS);
+                               PCI_ERR_COR_SUPPORTED);
 
     pci_set_long(dev->config + offset + PCI_ERR_COR_MASK,
                  PCI_ERR_COR_MASK_DEFAULT);
@@ -433,7 +433,7 @@ static void pcie_aer_update_log(PCIDevice *dev, const PCIEAERErr *err)
     }
 
     if ((err->flags & PCIE_AER_ERR_TLP_PREFIX_PRESENT) &&
-        (pci_get_long(dev->config + dev->exp.exp_cap + PCI_EXP_DEVCTL2) &
+        (pci_get_long(dev->config + dev->exp.exp_cap + PCI_EXP_DEVCAP2) &
          PCI_EXP_DEVCAP2_EETLPP)) {
         for (i = 0; i < ARRAY_SIZE(err->prefix); ++i) {
             /* 7.10.12 tlp prefix log register */
@@ -618,12 +618,12 @@ static bool pcie_aer_inject_uncor_error(PCIEAERInject *inj, bool is_fatal)
  * non-Function specific error must be recorded in all functions.
  * It is the responsibility of the caller of this function.
  * It is also caller's responsibility to determine which function should
- * report the rerror.
+ * report the error.
  *
  * 6.2.4 Error Logging
- * 6.2.5 Sqeunce of Device Error Signaling and Logging Operations
- * table 6-2: Flowchard Showing Sequence of Device Error Signaling and Logging
- *            Operations
+ * 6.2.5 Sequence of Device Error Signaling and Logging Operations
+ * Figure 6-2: Flowchart Showing Sequence of Device Error Signaling and Logging
+ *             Operations
  */
 int pcie_aer_inject_error(PCIDevice *dev, const PCIEAERErr *err)
 {
@@ -784,8 +784,7 @@ static const VMStateDescription vmstate_pcie_aer_err = {
     .name = "PCIE_AER_ERROR",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields     = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT32(status, PCIEAERErr),
         VMSTATE_UINT16(source_id, PCIEAERErr),
         VMSTATE_UINT16(flags, PCIEAERErr),
@@ -795,14 +794,21 @@ static const VMStateDescription vmstate_pcie_aer_err = {
     }
 };
 
+static bool pcie_aer_state_log_num_valid(void *opaque, int version_id)
+{
+    PCIEAERLog *s = opaque;
+
+    return s->log_num <= s->log_max;
+}
+
 const VMStateDescription vmstate_pcie_aer_log = {
     .name = "PCIE_AER_ERROR_LOG",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields     = (VMStateField[]) {
+    .fields = (VMStateField[]) {
         VMSTATE_UINT16(log_num, PCIEAERLog),
-        VMSTATE_UINT16(log_max, PCIEAERLog),
+        VMSTATE_UINT16_EQUAL(log_max, PCIEAERLog),
+        VMSTATE_VALIDATE("log_num <= log_max", pcie_aer_state_log_num_valid),
         VMSTATE_STRUCT_VARRAY_POINTER_UINT16(log, PCIEAERLog, log_num,
                               vmstate_pcie_aer_err, PCIEAERErr),
         VMSTATE_END_OF_LIST()
@@ -956,7 +962,7 @@ static int pcie_aer_parse_error_string(const char *error_name,
     return -EINVAL;
 }
 
-int do_pcie_aer_inject_error(Monitor *mon,
+int hmp_pcie_aer_inject_error(Monitor *mon,
                              const QDict *qdict, QObject **ret_data)
 {
     const char *id = qdict_get_str(qdict, "id");

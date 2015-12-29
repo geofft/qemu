@@ -35,6 +35,7 @@
 #include "qemu/iov.h"
 #include "qemu/range.h"
 #include "qapi/qmp/qerror.h"
+#include "qemu/error-report.h"
 
 #include "e1000_regs.h"
 
@@ -1738,8 +1739,8 @@ static void e1000_init_debug(void)
             }
         }
         if (!*debugname) {
-            qerror_report(QERR_INVALID_PARAMETER_VALUE, "E1000_DEBUG",
-                          "a comma-separated list of E1000 debug flags");
+            error_report(QERR_INVALID_PARAMETER_VALUE, "E1000_DEBUG",
+                         "a comma-separated list of E1000 debug flags");
             error_printf_unless_qmp(
                 "Try with argument '?' for a list.\n");
             exit(1);

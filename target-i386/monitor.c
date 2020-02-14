@@ -81,7 +81,7 @@ static bool ptiter_init(Monitor *mon, PTIter *it)
         {"PML4", "PDP", "PDE", "PTE"}, 12, 13
     };
 #endif
-    CPUState *env;
+    CPUArchState *env;
 
     env = mon_get_cpu_env();
 
